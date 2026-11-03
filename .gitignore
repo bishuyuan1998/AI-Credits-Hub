@@ -1,0 +1,21 @@
+# 敏感配置文件（切勿提交！）
+config.json
+.env
+
+# 日志与缓存
+*.log
+cron.log
+checkin.log
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 运行时数据
+*.db
+*.sqlite3
+
+# 系统与编辑器配置
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

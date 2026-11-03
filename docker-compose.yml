@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  ai-credits-hub:
+    build: .
+    container_name: ai-credits-hub
+    restart: always
+    ports:
+      - "9527:9527"
+    volumes:
+      - ./config.json:/app/config.json
+      - ./logs:/app/logs

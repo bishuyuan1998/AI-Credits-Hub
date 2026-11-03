@@ -1,0 +1,17 @@
+{
+  "auth": {
+    "admin_password": ""
+  },
+  "codebuddy": {
+    "accessToken": "",
+    "refreshToken": "",
+    "nickname": "我的账号",
+    "uid": ""
+  },
+  "trae": {
+    "accessToken": "",
+    "refreshToken": "",
+    "uid": "",
+    "deviceId": ""
+  }
+}
