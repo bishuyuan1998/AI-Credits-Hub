@@ -271,6 +271,7 @@ def fetch_single_trae(acc):
         "active": bool(token),
         "today_checked": False,
         "credits": 0,
+        "total_credits": 600,
         "consumed": 0,
         "used_pct": 0,
         "expire_time": "-",
@@ -293,41 +294,41 @@ def fetch_single_trae(acc):
         "x-app-version": "1.107.1"
     }
 
-    # 1. 额度信息
+    # 1. 签到状态
     try:
-        r = s.get("https://api.trae.cn/trae/api/v2/ug/user_status", headers=headers, timeout=8)
-        if r.status_code == 200 and r.json().get("code") == 0:
-            d = r.json().get("data", {})
-            res["valid"] = True
-            pkg = d.get("package_details", [{}])[0] if d.get("package_details") else {}
-            res["credits"] = pkg.get("total_tokens", 0)
-            res["consumed"] = pkg.get("consumed_tokens", 0)
-            if res["credits"] > 0:
-                res["used_pct"] = round((res["consumed"] / (res["credits"] + res["consumed"])) * 100, 1)
+        r_st = s.post("https://api.trae.cn/trae/api/v2/ug/checkin_credits/status", headers=headers, data='{"req_source": 1}', timeout=8)
+        if r_st.status_code == 200 and r_st.json().get("code") == 0:
+            res["today_checked"] = r_st.json().get("did_checked_in", False)
+    except Exception:
+        pass
 
-            res["expire_time"] = pkg.get("expire_time", "2026-11-30 23:59:59")
-            try:
-                diff = datetime.datetime.strptime(res["expire_time"], "%Y-%m-%d %H:%M:%S") - datetime.datetime.now()
-                res["expire_days"] = max(0, diff.days)
-            except Exception:
-                res["expire_days"] = 30
-        elif r.status_code == 401:
+    # 2. 额度与权益列表
+    try:
+        r_ent = s.post("https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list", headers=headers, json={}, timeout=8)
+        if r_ent.status_code == 200:
+            ent = r_ent.json()
+            sm = ent.get("usage_summary", {})
+            total_amt = sm.get("total_amount", 600)
+            consumed = sm.get("consumed_amount", 0)
+            res["valid"] = True
+            res["total_credits"] = total_amt
+            res["consumed"] = round(consumed, 1)
+            res["credits"] = round(total_amt - consumed, 1)
+            res["used_pct"] = round((consumed / total_amt * 100), 1) if total_amt else 0
+            packs = ent.get("user_entitlement_pack_list", [])
+            if packs:
+                ts = packs[0].get("entitlement_base_info", {}).get("end_time")
+                if ts:
+                    exp = datetime.datetime.fromtimestamp(ts)
+                    res["expire_time"] = exp.strftime("%Y-%m-%d %H:%M:%S")
+                    res["expire_days"] = max(0, (exp - datetime.datetime.now()).days)
+            res["status_text"] = "今日已签" if res["today_checked"] else "待签到"
+        elif r_ent.status_code == 401 or (r_st.status_code == 200 and r_st.json().get("code") == 1001):
             res["status_text"] = "Token 已失效 (401)"
         else:
-            res["status_text"] = f"响应异常 ({r.status_code})"
+            res["status_text"] = f"响应异常 ({r_ent.status_code})"
     except Exception as e:
         res["status_text"] = f"请求错误: {str(e)[:25]}"
-
-    # 2. 签到状态
-    if res["valid"]:
-        try:
-            r = s.get("https://api.trae.cn/trae/api/v2/ug/checkin_credits/user_status", headers=headers, timeout=8)
-            if r.status_code == 200 and r.json().get("code") == 0:
-                d = r.json().get("data", {})
-                res["today_checked"] = d.get("today_checked_in", False)
-                res["status_text"] = "今日已签" if res["today_checked"] else "待签到"
-        except Exception:
-            pass
 
     return res
 
