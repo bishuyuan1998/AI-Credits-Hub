@@ -62,6 +62,27 @@ def log(msg):
     except Exception:
         pass
 
+def extract_jwt_claims(token):
+    try:
+        parts = token.strip().split(".")
+        if len(parts) >= 2:
+            import base64
+            b64_str = parts[1]
+            pad = len(b64_str) % 4
+            if pad:
+                b64_str += "=" * (4 - pad)
+            payload = base64.urlsafe_b64decode(b64_str.encode("ascii")).decode("utf-8", "ignore")
+            return json.loads(payload)
+    except Exception:
+        pass
+    return {}
+
+def format_phone(p):
+    p = str(p or "").strip()
+    if len(p) == 11 and p.isdigit():
+        return f"{p[:3]}****{p[-4:]}"
+    return p
+
 def load_config():
     """读取配置并自动将旧的单账号格式平滑迁移至多账号列表"""
     cfg = {}
@@ -81,7 +102,7 @@ def load_config():
 
     changed = False
     if "auth" not in cfg:
-        cfg["auth"] = {"admin_key": "888888", "admin_password": ""}
+        cfg["auth"] = {"admin_key": "Hub_98bxy_Sec2026", "admin_password": ""}
         changed = True
     if "settings" not in cfg:
         cfg["settings"] = {"auto_checkin_hour": 9, "auto_checkin_minute": 0}
@@ -95,6 +116,7 @@ def load_config():
             cfg["codebuddy_accounts"].append({
                 "id": "cb_" + uuid.uuid4().hex[:8],
                 "remark": old_cb.get("nickname") or "主账号",
+                "phone": old_cb.get("phone", ""),
                 "accessToken": old_cb.get("accessToken", "").strip(),
                 "refreshToken": old_cb.get("refreshToken", "").strip(),
                 "uid": old_cb.get("uid", ""),
@@ -102,6 +124,14 @@ def load_config():
                 "enabled": True
             })
             changed = True
+
+    # 自动从 JWT 中补全 CodeBuddy 手机号
+    for acc in cfg.get("codebuddy_accounts", []):
+        if not acc.get("phone") and acc.get("accessToken"):
+            c = extract_jwt_claims(acc["accessToken"])
+            if c.get("preferred_username"):
+                acc["phone"] = str(c.get("preferred_username")).strip()
+                changed = True
 
     # 兼容与平滑迁移 TRAE 单账号 -> 多账号列表
     if "trae_accounts" not in cfg:
@@ -111,6 +141,7 @@ def load_config():
             cfg["trae_accounts"].append({
                 "id": "trae_" + uuid.uuid4().hex[:8],
                 "remark": f"主账号 (UID: {old_trae.get('uid', '未配置')})",
+                "phone": old_trae.get("phone", ""),
                 "accessToken": old_trae.get("accessToken", "").strip(),
                 "refreshToken": old_trae.get("refreshToken", "").strip(),
                 "uid": str(old_trae.get("uid", "")),
@@ -136,10 +167,14 @@ def save_config(cfg):
 # ====================================================================
 def fetch_single_codebuddy(acc):
     token = acc.get("accessToken", "").strip()
+    claims = extract_jwt_claims(token)
+    phone = acc.get("phone") or claims.get("preferred_username") or ""
     res = {
         "id": acc.get("id"),
         "remark": acc.get("remark") or "未命名账号",
-        "nickname": acc.get("nickname") or "未获取",
+        "nickname": acc.get("nickname") or claims.get("nickname") or "未获取",
+        "phone": phone,
+        "masked_phone": format_phone(phone),
         "uid": acc.get("uid") or "-",
         "enabled": acc.get("enabled", True),
         "active": bool(token),
@@ -185,9 +220,12 @@ def fetch_single_codebuddy(acc):
 
 def fetch_single_trae(acc):
     token = acc.get("accessToken", "").strip()
+    phone = acc.get("phone") or acc.get("username") or ""
     res = {
         "id": acc.get("id"),
         "remark": acc.get("remark") or "未命名账号",
+        "phone": phone,
+        "masked_phone": format_phone(phone),
         "uid": acc.get("uid") or "未配置",
         "deviceId": acc.get("deviceId") or "766820083601979",
         "enabled": acc.get("enabled", True),
@@ -553,6 +591,11 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div>
+          <label class="block text-slate-300 font-medium mb-1">绑定手机号 / 标识 (用于大屏醒目标识，CodeBuddy 可留空自动提取):</label>
+          <input type="text" id="acc_phone" placeholder="例如: 13032213110 或 1850175526" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+        </div>
+
+        <div>
           <div class="flex justify-between items-center mb-1">
             <label class="text-slate-300 font-medium">AccessToken (访问凭据):</label>
             <span id="tokenHelpLink" class="text-indigo-400 hover:underline cursor-pointer">快捷获取指引</span>
@@ -685,9 +728,16 @@ HTML_PAGE = """<!DOCTYPE html>
                   ${acc.remark}
                   ${!acc.enabled ? '<span class="text-[10px] bg-slate-700 text-slate-400 px-1.5 py-0.5 rounded">已暂停</span>' : ''}
                 </h3>
-                <p class="text-xs text-slate-400 mt-0.5 font-mono">
-                  ${platform === 'codebuddy' ? (acc.nickname || '未同步') : ('UID: ' + acc.uid)}
-                </p>
+                <div class="flex items-center gap-2 text-xs text-slate-400 mt-1 flex-wrap">
+                  ${acc.masked_phone ? `
+                    <span class="inline-flex items-center gap-1.5 text-emerald-300 font-mono bg-emerald-500/15 px-2 py-0.5 rounded-md border border-emerald-500/30 text-xs font-semibold">
+                      <i class="fa-solid fa-mobile-screen text-[11px]"></i> ${acc.masked_phone}
+                    </span>
+                  ` : ''}
+                  <span class="font-mono text-slate-400 text-xs">
+                    ${platform === 'codebuddy' ? (acc.nickname ? `(${acc.nickname})` : '') : ('UID: ' + acc.uid)}
+                  </span>
+                </div>
               </div>
               ${badge}
             </div>
@@ -777,6 +827,7 @@ HTML_PAGE = """<!DOCTYPE html>
       document.getElementById('acc_id').value = '';
       document.getElementById('acc_platform').value = platform;
       document.getElementById('acc_remark').value = '';
+      document.getElementById('acc_phone').value = '';
       document.getElementById('acc_token').value = '';
       document.getElementById('acc_trae_uid').value = '';
       document.getElementById('acc_trae_did').value = '766820083601979';
@@ -807,6 +858,7 @@ HTML_PAGE = """<!DOCTYPE html>
         id: document.getElementById('acc_id').value,
         platform: document.getElementById('acc_platform').value,
         remark: document.getElementById('acc_remark').value.trim() || '我的账号',
+        phone: document.getElementById('acc_phone').value.trim(),
         accessToken: document.getElementById('acc_token').value.trim(),
         uid: document.getElementById('acc_trae_uid').value.trim(),
         deviceId: document.getElementById('acc_trae_did').value.trim() || '766820083601979'
@@ -1072,6 +1124,7 @@ class Handler(BaseHTTPRequestHandler):
             account_data = {
                 "id": acc_id,
                 "remark": body.get("remark") or "账号",
+                "phone": body.get("phone", "").strip(),
                 "accessToken": body.get("accessToken", "").strip(),
                 "enabled": True
             }
@@ -1086,6 +1139,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"success": False, "error": f"Token 校验失败: {test_res.get('status_text')}"}).encode("utf-8"))
                     return
                 account_data["nickname"] = test_res.get("nickname") or account_data["remark"]
+                if not account_data["phone"] and test_res.get("phone"):
+                    account_data["phone"] = test_res.get("phone")
             elif platform == "trae":
                 account_data["uid"] = str(body.get("uid", "")).strip()
                 account_data["deviceId"] = body.get("deviceId", "766820083601979").strip()
@@ -1096,6 +1151,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps({"success": False, "error": f"Token 校验失败: {test_res.get('status_text')}"}).encode("utf-8"))
                     return
+                if not account_data["phone"] and test_res.get("phone"):
+                    account_data["phone"] = test_res.get("phone")
 
             # 更新或添加
             existing_idx = next((i for i, a in enumerate(cfg[key_name]) if a.get("id") == acc_id), -1)
