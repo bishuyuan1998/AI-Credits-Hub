@@ -598,8 +598,8 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="space-y-4 text-xs">
         <div>
           <label class="block text-slate-300 font-medium mb-1">安全访问密码 / Secret Key:</label>
-          <input type="text" id="cfg_admin_key" placeholder="如 888888 (访问时在网址后加 ?key=888888)" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
-          <p class="text-[11px] text-slate-400 mt-1">设置后未经授权的陌生访问将展示 403 锁定屏，保护你的多账号隐私。</p>
+          <input type="text" id="cfg_admin_key" placeholder="设置复杂的自定义访问密钥 (访问时在网址后加 ?key=你的密钥)" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+          <p class="text-[11px] text-slate-400 mt-1"><i class="fa-solid fa-shield-halved text-emerald-400 mr-1"></i> 启用物理阻断保护：任何未携带正确密钥的陌生请求将被立即切断连接 (ERR_CONNECTION_CLOSED)，对外彻底隐身，不泄露任何服务信息。</p>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
@@ -913,50 +913,6 @@ HTML_PAGE = """<!DOCTYPE html>
 """
 
 # ====================================================================
-#  403 锁定屏（密码保护）
-# ====================================================================
-LOCK_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <title>🔒 403 访问受限 | AI-Credits-Hub</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    body { background-color: #0b0f19; background-image: radial-gradient(circle at 50% 0%, rgba(239, 68, 68, 0.15) 0%, transparent 75%); }
-    .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(14px); border: 1px solid rgba(255, 255, 255, 0.08); }
-  </style>
-</head>
-<body class="text-slate-100 min-h-screen flex items-center justify-center p-4">
-  <div class="glass max-w-md w-full p-8 rounded-2xl shadow-2xl text-center space-y-6">
-    <div class="inline-flex p-4 bg-rose-500/20 text-rose-400 rounded-2xl text-3xl">
-      <i class="fa-solid fa-lock"></i>
-    </div>
-    <div>
-      <h2 class="text-xl font-bold text-white">私有 AI 算力监控后台</h2>
-      <p class="text-xs text-slate-400 mt-2">当前控制台已受密钥后缀保护，请输入管理员密钥解锁</p>
-    </div>
-    <form onsubmit="handleAuth(event)" class="space-y-4">
-      <input type="password" id="authKey" placeholder="输入访问密钥 (如 888888)..." class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-slate-200 text-center font-mono focus:outline-none focus:border-indigo-500">
-      <button type="submit" class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl text-sm transition-all shadow-lg shadow-indigo-500/20">
-        验证并进入后台
-      </button>
-    </form>
-  </div>
-  <script>
-    function handleAuth(e) {
-      e.preventDefault();
-      const k = document.getElementById('authKey').value.trim();
-      if (!k) return;
-      document.cookie = "ai_hub_key=" + encodeURIComponent(k) + "; path=/; max-age=2592000";
-      window.location.search = "?key=" + encodeURIComponent(k);
-    }
-  </script>
-</body>
-</html>
-"""
-
-# ====================================================================
 #  HTTP Request Handler
 # ====================================================================
 class Handler(BaseHTTPRequestHandler):
@@ -992,7 +948,20 @@ class Handler(BaseHTTPRequestHandler):
 
         return False
 
+    def drop_connection(self):
+        """直接物理阻断 TCP 连接：不返回任何 HTTP 状态码、协议头或内容，外部扫描器/陌生人只会得到 ERR_EMPTY_RESPONSE 或 ERR_CONNECTION_CLOSED"""
+        self.close_connection = True
+        try:
+            import socket
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+        except Exception:
+            pass
+
     def do_HEAD(self):
+        if not self.check_auth():
+            self.drop_connection()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -1003,12 +972,9 @@ class Handler(BaseHTTPRequestHandler):
         cfg = load_config()
         admin_key = cfg.get("auth", {}).get("admin_key", "").strip()
 
-        # 权限校验
+        # 权限校验：无密钥直接物理阻断连接，不暴露任何服务信息
         if not self.check_auth():
-            self.send_response(403)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(LOCK_HTML.encode("utf-8"))
+            self.drop_connection()
             return
 
         if p in ("/", "/index.html"):
@@ -1046,10 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.check_auth():
-            self.send_response(403)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": False, "error": "403 Forbidden"}).encode("utf-8"))
+            self.drop_connection()
             return
 
         p = urlparse(self.path).path
