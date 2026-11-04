@@ -1,17 +1,32 @@
 {
   "auth": {
+    "admin_key": "888888",
     "admin_password": ""
   },
-  "codebuddy": {
-    "accessToken": "",
-    "refreshToken": "",
-    "nickname": "我的账号",
-    "uid": ""
+  "settings": {
+    "auto_checkin_hour": 9,
+    "auto_checkin_minute": 0
   },
-  "trae": {
-    "accessToken": "",
-    "refreshToken": "",
-    "uid": "",
-    "deviceId": ""
-  }
+  "codebuddy_accounts": [
+    {
+      "id": "cb_demo_01",
+      "remark": "CodeBuddy 主账号",
+      "accessToken": "YOUR_CODEBUDDY_ACCESS_TOKEN",
+      "refreshToken": "",
+      "nickname": "示例主号",
+      "uid": "",
+      "enabled": true
+    }
+  ],
+  "trae_accounts": [
+    {
+      "id": "trae_demo_01",
+      "remark": "TRAE 主账号",
+      "accessToken": "YOUR_TRAE_ACCESS_TOKEN",
+      "refreshToken": "",
+      "uid": "2990000000000000",
+      "deviceId": "766820083601979",
+      "enabled": true
+    }
+  ]
 }
