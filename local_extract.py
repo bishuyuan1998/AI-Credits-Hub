@@ -177,6 +177,7 @@ def push_to_remote(server_url, key, platform, acc_data):
         payload = {
             "platform": platform,
             "remark": acc_data.get("remark") or acc_data.get("nickname") or "本机自动提取账号",
+            "phone": acc_data.get("phone", ""),
             "accessToken": acc_data.get("accessToken", ""),
             "refreshToken": acc_data.get("refreshToken", ""),
             "uid": acc_data.get("uid", ""),

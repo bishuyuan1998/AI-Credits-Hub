@@ -21,7 +21,7 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
 
-# 保证控制台正常输出 UTF-8
+# 保证控制台输出 UTF-8
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -33,7 +33,7 @@ try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 except ImportError:
-    print("[错误] 缺少 requests 库，请先执行: pip install requests")
+    print("[错误] 缺少 requests 库，请执行: pip install requests")
     sys.exit(1)
 
 PORT = int(os.environ.get("PORT", 9527))
@@ -84,7 +84,7 @@ def format_phone(p):
     return p
 
 def load_config():
-    """读取配置并自动将旧的单账号格式平滑迁移至多账号列表"""
+    """读取配置并自动将旧的单账号格式平滑迁移为多账号列表"""
     cfg = {}
     if os.path.exists(CONFIG_FILE):
         try:
@@ -108,7 +108,7 @@ def load_config():
         cfg["settings"] = {"auto_checkin_hour": 9, "auto_checkin_minute": 0}
         changed = True
 
-    # 兼容与平滑迁移 CodeBuddy 单账号 -> 多账号列表
+    # 平滑迁移旧 CodeBuddy 账号 -> 账号列表
     if "codebuddy_accounts" not in cfg:
         cfg["codebuddy_accounts"] = []
         old_cb = cfg.get("codebuddy")
@@ -133,14 +133,14 @@ def load_config():
                 acc["phone"] = str(c.get("preferred_username")).strip()
                 changed = True
 
-    # 兼容与平滑迁移 TRAE 单账号 -> 多账号列表
+    # 平滑迁移旧 TRAE 账号 -> 账号列表
     if "trae_accounts" not in cfg:
         cfg["trae_accounts"] = []
         old_trae = cfg.get("trae")
         if old_trae and isinstance(old_trae, dict) and old_trae.get("accessToken"):
             cfg["trae_accounts"].append({
                 "id": "trae_" + uuid.uuid4().hex[:8],
-                "remark": f"主账号 (UID: {old_trae.get('uid', '未配置')})",
+                "remark": f"主账号 (UID: {old_trae.get('uid', '未设')})",
                 "phone": old_trae.get("phone", ""),
                 "accessToken": old_trae.get("accessToken", "").strip(),
                 "refreshToken": old_trae.get("refreshToken", "").strip(),
@@ -169,17 +169,21 @@ def fetch_single_codebuddy(acc):
     token = acc.get("accessToken", "").strip()
     claims = extract_jwt_claims(token)
     phone = acc.get("phone") or claims.get("preferred_username") or ""
+    uid = acc.get("uid") or claims.get("sub") or ""
+    nickname = acc.get("nickname") or claims.get("nickname") or ""
     res = {
         "id": acc.get("id"),
-        "remark": acc.get("remark") or "未命名账号",
-        "nickname": acc.get("nickname") or claims.get("nickname") or "未获取",
+        "remark": acc.get("remark") or "我的账号",
+        "nickname": nickname or "用户",
         "phone": phone,
         "masked_phone": format_phone(phone),
-        "uid": acc.get("uid") or "-",
+        "uid": uid or "-",
         "enabled": acc.get("enabled", True),
         "active": bool(token),
         "today_checked": False,
         "credits": 0,
+        "total_earned": 0,
+        "plan_name": "体验版",
         "streak_days": 0,
         "expire_time": "-",
         "expire_days": 0,
@@ -192,16 +196,39 @@ def fetch_single_codebuddy(acc):
     s = get_session()
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "X-User-Id": uid,
+        "Accept-Language": "zh",
+        "Origin": "https://www.codebuddy.cn",
+        "Referer": "https://www.codebuddy.cn/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddy/1.0.0",
+        "Content-Type": "application/json"
     }
+
+    # 1. 查询真实实时可用积分余额与套餐版本 (get-user-resource-summary)
+    has_summary = False
     try:
-        r = s.post("https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status", headers=headers, timeout=8)
+        r_sum = s.post("https://www.codebuddy.cn/billing/meter/get-user-resource-summary", headers=headers, json={}, timeout=8)
+        if r_sum.status_code == 200 and r_sum.json().get("code") == 0:
+            d_sum = r_sum.json().get("data", {})
+            has_summary = True
+            total_credits_val = d_sum.get("TotalCredits", 0)
+            res["credits"] = round(float(total_credits_val), 1)
+            is_paid = d_sum.get("IsPaidUser", False)
+            pkg_name = d_sum.get("SubscriptionPackageName")
+            res["plan_name"] = pkg_name if pkg_name else ("付费专业版" if is_paid else "体验版")
+    except Exception as e:
+        log(f"[CodeBuddy 余额查询异常] {e}")
+
+    # 2. 查询每日签到状态与连签天数 (checkin-activity-status)
+    try:
+        r = s.post("https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status", headers=headers, json={}, timeout=8)
         if r.status_code == 200 and r.json().get("code") == 0:
             d = r.json().get("data", {})
             res["valid"] = True
             res["today_checked"] = d.get("today_checked_in", False)
-            res["credits"] = d.get("total_credits", 0)
+            res["total_earned"] = d.get("total_credits", 0)
+            if not has_summary:
+                res["credits"] = d.get("total_credits", 0)
             res["streak_days"] = d.get("streak_days", 0)
             res["expire_time"] = d.get("end_time", "2026-12-31 23:59:59")
             try:
@@ -209,13 +236,25 @@ def fetch_single_codebuddy(acc):
                 res["expire_days"] = max(0, diff.days)
             except Exception:
                 res["expire_days"] = 60
-            res["status_text"] = f"连签 {res['streak_days']} 天 · 积分 {res['credits']}"
+            res["status_text"] = f"连签 {res['streak_days']} 天 · 累计所得 {res['total_earned']}"
         elif r.status_code == 401:
-            res["status_text"] = "Token 已失效 (401)"
+            if has_summary:
+                res["valid"] = True
+                res["status_text"] = "有效账号"
+            else:
+                res["status_text"] = "Token 已失效 (401)"
         else:
-            res["status_text"] = f"响应异常 ({r.status_code})"
+            if has_summary:
+                res["valid"] = True
+                res["status_text"] = "有效账号"
+            else:
+                res["status_text"] = f"响应异常 ({r.status_code})"
     except Exception as e:
-        res["status_text"] = f"网络连接重试中: {str(e)[:25]}"
+        if has_summary:
+            res["valid"] = True
+            res["status_text"] = "有效账号"
+        else:
+            res["status_text"] = f"请求错误: {str(e)[:25]}"
     return res
 
 def fetch_single_trae(acc):
@@ -232,7 +271,6 @@ def fetch_single_trae(acc):
         "active": bool(token),
         "today_checked": False,
         "credits": 0,
-        "total_credits": 600,
         "consumed": 0,
         "used_pct": 0,
         "expire_time": "-",
@@ -243,6 +281,7 @@ def fetch_single_trae(acc):
     if not token:
         return res
 
+    s = get_session()
     headers = {
         "Authorization": "Cloud-IDE-JWT " + token,
         "X-User-Region": "CN",
@@ -253,52 +292,60 @@ def fetch_single_trae(acc):
         "x-os-version": "10.0.19045",
         "x-app-version": "1.107.1"
     }
-    s = get_session()
-    try:
-        r_st = s.post("https://api.trae.cn/trae/api/v2/ug/checkin_credits/status", headers=headers, data='{"req_source": 1}', timeout=8)
-        if r_st.status_code == 200 and r_st.json().get("code") == 0:
-            res["valid"] = True
-            res["today_checked"] = r_st.json().get("did_checked_in", False)
 
-        r_ent = s.post("https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list", headers=headers, json={}, timeout=8)
-        if r_ent.status_code == 200:
+    # 1. 额度信息
+    try:
+        r = s.get("https://api.trae.cn/trae/api/v2/ug/user_status", headers=headers, timeout=8)
+        if r.status_code == 200 and r.json().get("code") == 0:
+            d = r.json().get("data", {})
             res["valid"] = True
-            ent = r_ent.json()
-            sm = ent.get("usage_summary", {})
-            total_amt = sm.get("total_amount", 600)
-            consumed = sm.get("consumed_amount", 0)
-            res["total_credits"] = total_amt
-            res["consumed"] = round(consumed, 1)
-            res["credits"] = round(total_amt - consumed, 1)
-            res["used_pct"] = round((consumed / total_amt * 100), 1) if total_amt else 0
-            packs = ent.get("user_entitlement_pack_list", [])
-            if packs:
-                ts = packs[0].get("entitlement_base_info", {}).get("end_time")
-                if ts:
-                    exp = datetime.datetime.fromtimestamp(ts)
-                    res["expire_time"] = exp.strftime("%Y-%m-%d %H:%M:%S")
-                    res["expire_days"] = max(0, (exp - datetime.datetime.now()).days)
-            res["status_text"] = f"已消耗 {res['consumed']} / 配额 {total_amt} 点 ({res['used_pct']}%)"
-        elif r_ent.status_code == 401 or (r_st.status_code == 200 and r_st.json().get("code") == 1001):
+            pkg = d.get("package_details", [{}])[0] if d.get("package_details") else {}
+            res["credits"] = pkg.get("total_tokens", 0)
+            res["consumed"] = pkg.get("consumed_tokens", 0)
+            if res["credits"] > 0:
+                res["used_pct"] = round((res["consumed"] / (res["credits"] + res["consumed"])) * 100, 1)
+
+            res["expire_time"] = pkg.get("expire_time", "2026-11-30 23:59:59")
+            try:
+                diff = datetime.datetime.strptime(res["expire_time"], "%Y-%m-%d %H:%M:%S") - datetime.datetime.now()
+                res["expire_days"] = max(0, diff.days)
+            except Exception:
+                res["expire_days"] = 30
+        elif r.status_code == 401:
             res["status_text"] = "Token 已失效 (401)"
         else:
-            res["status_text"] = f"响应异常 ({r_ent.status_code})"
+            res["status_text"] = f"响应异常 ({r.status_code})"
     except Exception as e:
-        res["status_text"] = f"网络连接重试中: {str(e)[:25]}"
+        res["status_text"] = f"请求错误: {str(e)[:25]}"
+
+    # 2. 签到状态
+    if res["valid"]:
+        try:
+            r = s.get("https://api.trae.cn/trae/api/v2/ug/checkin_credits/user_status", headers=headers, timeout=8)
+            if r.status_code == 200 and r.json().get("code") == 0:
+                d = r.json().get("data", {})
+                res["today_checked"] = d.get("today_checked_in", False)
+                res["status_text"] = "今日已签" if res["today_checked"] else "待签到"
+        except Exception:
+            pass
+
     return res
 
-# ====================================================================
-#  签到执行核心
-# ====================================================================
 def checkin_codebuddy_account(acc):
     token = acc.get("accessToken", "").strip()
     if not token or not acc.get("enabled", True):
         return "未启用或无 Token"
+    claims = extract_jwt_claims(token)
+    uid = acc.get("uid") or claims.get("sub") or ""
     s = get_session()
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "X-User-Id": uid,
+        "Accept-Language": "zh",
+        "Origin": "https://www.codebuddy.cn",
+        "Referer": "https://www.codebuddy.cn/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddy/1.0.0",
+        "Content-Type": "application/json"
     }
     try:
         r = s.post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin", headers=headers, timeout=8)
@@ -361,48 +408,55 @@ DATA_CACHE = {}
 def update_cache():
     global DATA_CACHE
     cfg = load_config()
-    
-    cb_list = [fetch_single_codebuddy(acc) for acc in cfg.get("codebuddy_accounts", [])]
-    trae_list = [fetch_single_trae(acc) for acc in cfg.get("trae_accounts", [])]
+    cb_accounts = cfg.get("codebuddy_accounts", [])
+    trae_accounts = cfg.get("trae_accounts", [])
 
-    total_accounts = len(cb_list) + len(trae_list)
-    today_checked_count = sum(1 for a in cb_list + trae_list if a.get("today_checked"))
-    total_credits = sum(a.get("credits", 0) for a in cb_list + trae_list)
+    cb_res = [fetch_single_codebuddy(a) for a in cb_accounts]
+    trae_res = [fetch_single_trae(a) for a in trae_accounts]
+
+    total_acc = len(cb_res) + len(trae_res)
+    checked_count = sum(1 for a in cb_res + trae_res if a.get("today_checked"))
+    # 计算当前可用剩余总算力
+    total_credits = round(sum(float(a.get("credits", 0)) for a in cb_res + trae_res), 1)
 
     DATA_CACHE = {
-        "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "summary": {
-            "total_accounts": total_accounts,
-            "today_checked_count": today_checked_count,
-            "total_credits": round(total_credits, 1),
+            "total_accounts": total_acc,
+            "today_checked_count": checked_count,
+            "total_credits": total_credits,
             "scheduler_time": f"{cfg.get('settings', {}).get('auto_checkin_hour', 9):02d}:{cfg.get('settings', {}).get('auto_checkin_minute', 0):02d}"
         },
-        "codebuddy_accounts": cb_list,
-        "trae_accounts": trae_list
+        "codebuddy_accounts": cb_res,
+        "trae_accounts": trae_res
     }
+    return DATA_CACHE
 
-def scheduler_thread():
-    time.sleep(2)
-    update_cache()
-    last_day = None
+def scheduler_worker():
+    log("[定时任务模块启动] 守护进程持续监听每日签到时刻...")
+    last_run_day = None
     while True:
         try:
             cfg = load_config()
-            st = cfg.get("settings", {})
-            target_hour = st.get("auto_checkin_hour", 9)
-            target_min = st.get("auto_checkin_minute", 0)
+            hour = cfg.get("settings", {}).get("auto_checkin_hour", 9)
+            minute = cfg.get("settings", {}).get("auto_checkin_minute", 0)
+
             now = datetime.datetime.now()
-            if now.hour == target_hour and now.minute == target_min and last_day != now.day:
-                last_day = now.day
+            today_str = now.strftime("%Y-%m-%d")
+
+            if now.hour == hour and now.minute == minute and last_run_day != today_str:
+                log(f"[触发每日定时打卡] 开始为所有账号执行签到任务...")
                 execute_all_checkin()
                 update_cache()
-            update_cache()
-        except Exception:
-            pass
-        time.sleep(60)
+                last_run_day = today_str
+
+            time.sleep(30)
+        except Exception as e:
+            log(f"[调度循环异常] {e}")
+            time.sleep(60)
 
 # ====================================================================
-#  HTML 前端模板（多账号卡片 + 模态框）
+#  UI 前端面板 HTML 模板 (内嵌多账号卡片 + 模态框 + 快捷登录)
 # ====================================================================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN" class="dark">
@@ -446,14 +500,17 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="w-px h-3 bg-slate-700"></div>
           <div>今日已打卡: <span id="stat_checked" class="font-bold text-emerald-400">0</span></div>
           <div class="w-px h-3 bg-slate-700"></div>
-          <div>累计总算力: <span id="stat_credits" class="font-bold text-amber-300">0</span></div>
+          <div>累计可用算力: <span id="stat_credits" class="font-bold text-amber-300">0</span></div>
         </div>
 
         <button onclick="triggerCheckinAll()" id="checkinAllBtn" class="px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white font-medium rounded-xl shadow-lg shadow-emerald-500/20 flex items-center gap-2 text-sm transition-all transform active:scale-95">
           <i class="fa-solid fa-bolt"></i> 立即全平台签到
         </button>
-        <button onclick="openAddAccountModal()" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl shadow-lg shadow-indigo-500/20 flex items-center gap-2 text-sm transition-all">
-          <i class="fa-solid fa-user-plus"></i> 添加账号
+        <button onclick="openLoginHelperModal()" class="px-4 py-2.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-medium rounded-xl shadow-lg shadow-indigo-500/20 flex items-center gap-2 text-sm transition-all">
+          <i class="fa-solid fa-right-to-bracket"></i> 快捷登录 / 录入小号
+        </button>
+        <button onclick="openAddAccountModal()" class="px-3.5 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 hover:text-white font-medium rounded-xl text-sm transition-all flex items-center gap-1.5" title="手动录入账号">
+          <i class="fa-solid fa-plus"></i> 添加
         </button>
         <button onclick="openSettingsModal()" class="p-2.5 glass hover:bg-slate-700/50 rounded-xl text-slate-300 hover:text-white text-sm" title="系统与凭证设置">
           <i class="fa-solid fa-gear"></i>
@@ -472,9 +529,14 @@ HTML_PAGE = """<!DOCTYPE html>
           <h2 class="text-lg font-bold text-slate-200">腾讯 CodeBuddy / WorkBuddy 账号池</h2>
           <span id="cb_count_badge" class="px-2 py-0.5 text-xs bg-slate-800 text-slate-400 rounded-md border border-slate-700">0 个账号</span>
         </div>
-        <button onclick="openAddAccountModal('codebuddy')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
-          <i class="fa-solid fa-plus"></i> 录入 CodeBuddy 账号
-        </button>
+        <div class="flex items-center gap-3">
+          <button onclick="openLoginHelperModal('codebuddy')" class="text-xs text-indigo-400 hover:text-indigo-300 transition-colors flex items-center gap-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-lg border border-indigo-500/20">
+            <i class="fa-solid fa-qrcode"></i> 扫码 / 快捷登录
+          </button>
+          <button onclick="openAddAccountModal('codebuddy')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+            <i class="fa-solid fa-plus"></i> 手动录入
+          </button>
+        </div>
       </div>
       <div id="codebuddyGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
     </section>
@@ -487,9 +549,14 @@ HTML_PAGE = """<!DOCTYPE html>
           <h2 class="text-lg font-bold text-slate-200">字节跳动 TRAE CN (SOLO) 账号池</h2>
           <span id="trae_count_badge" class="px-2 py-0.5 text-xs bg-slate-800 text-slate-400 rounded-md border border-slate-700">0 个账号</span>
         </div>
-        <button onclick="openAddAccountModal('trae')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
-          <i class="fa-solid fa-plus"></i> 录入 TRAE 账号
-        </button>
+        <div class="flex items-center gap-3">
+          <button onclick="openLoginHelperModal('trae')" class="text-xs text-indigo-400 hover:text-indigo-300 transition-colors flex items-center gap-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-lg border border-indigo-500/20">
+            <i class="fa-solid fa-qrcode"></i> 扫码 / 快捷登录
+          </button>
+          <button onclick="openAddAccountModal('trae')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+            <i class="fa-solid fa-plus"></i> 手动录入
+          </button>
+        </div>
       </div>
       <div id="traeGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
     </section>
@@ -517,27 +584,20 @@ HTML_PAGE = """<!DOCTYPE html>
               <p class="text-xs text-slate-400 mt-1">每日 +100 积分，连续 7 天触发额外盲盒大奖，积分池可抵扣 DeepSeek-V3 满血调用。</p>
             </div>
           </div>
-          <div class="p-3.5 rounded-xl bg-slate-800/60 border border-slate-700/50 flex items-start gap-3">
-            <div class="p-2 bg-purple-500/20 text-purple-400 rounded-lg text-sm"><i class="fa-solid fa-clock"></i></div>
-            <div class="flex-1">
-              <div class="flex justify-between items-center"><span class="font-medium text-sm text-slate-200">Xiaomi MiMo 闲时 0.8 倍折扣</span><span class="text-xs text-purple-300 font-mono">0:00 - 8:00</span></div>
-              <p class="text-xs text-slate-400 mt-1">夜间至清晨调用全系 Pro / Omni 模型仅消耗 0.8 倍点数，大项目批量重构建议错峰执行。</p>
-            </div>
-          </div>
         </div>
       </section>
 
-      <!-- 备用方案 -->
+      <!-- 应急备用路线 -->
       <section class="glass p-6 rounded-2xl shadow-xl space-y-4">
         <div class="flex items-center justify-between border-b border-slate-700/60 pb-3">
-          <h2 class="text-lg font-semibold text-teal-300 flex items-center gap-2"><i class="fa-solid fa-shield-halved text-teal-400"></i> 主编程软件没额度的可靠备用方案</h2>
-          <span class="text-xs px-2.5 py-1 bg-teal-500/20 text-teal-300 rounded-full border border-teal-500/30">断粮兜底</span>
+          <h2 class="text-lg font-semibold text-indigo-300 flex items-center gap-2"><i class="fa-solid fa-shield-halved text-indigo-400"></i> 算力熔断与应急切换梯队</h2>
+          <span class="text-xs px-2.5 py-1 bg-indigo-500/20 text-indigo-300 rounded-full border border-indigo-500/30">应急推荐</span>
         </div>
         <div class="space-y-3">
           <div class="p-3.5 rounded-xl bg-gradient-to-r from-slate-800 to-indigo-950/40 border border-indigo-500/30 flex items-center justify-between">
             <div>
-              <span class="text-xs font-semibold text-indigo-400 uppercase tracking-wider">第一备用梯队 · 首选白嫖</span>
-              <h3 class="font-bold text-sm text-white mt-0.5">切换至 WorkBuddy / CodeBuddy</h3>
+              <span class="text-xs font-semibold text-indigo-400 uppercase tracking-wider">第一备用梯队 · 国内直连</span>
+              <h3 class="font-bold text-sm text-white mt-0.5">无缝切至 CodeBuddy 积分池</h3>
               <p class="text-xs text-slate-400 mt-1">使用本服务每天自动积攒的积分池，支持 DeepSeek-V3 满血调用，零成本续命。</p>
             </div>
             <span class="px-3 py-1 bg-indigo-500/20 text-indigo-300 text-xs rounded-lg border border-indigo-500/30">首推</span>
@@ -566,41 +626,131 @@ HTML_PAGE = """<!DOCTYPE html>
     </footer>
   </div>
 
-  <!-- 模态框 1：添加 / 编辑账号 -->
+  <!-- 模态框：添加 / 编辑账号 / 网页快捷登录 (多功能集合) -->
   <div id="accountModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-    <div class="glass max-w-xl w-full p-6 md:p-8 rounded-2xl shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto custom-scroll">
+    <div class="glass max-w-2xl w-full p-6 md:p-8 rounded-2xl shadow-2xl space-y-6 max-h-[92vh] overflow-y-auto custom-scroll">
+      
       <div class="flex justify-between items-center border-b border-slate-700/60 pb-4">
-        <h3 id="accModalTitle" class="text-lg font-bold text-white flex items-center gap-2"><i class="fa-solid fa-user-plus text-indigo-400"></i> 添加 AI 账号</h3>
+        <div>
+          <h3 id="accModalTitle" class="text-lg font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与管理 AI 账号
+          </h3>
+          <p class="text-xs text-slate-400 mt-0.5">支持网页扫码秒导、本地客户端提取、或智能粘贴录入</p>
+        </div>
         <button onclick="closeAccountModal()" class="text-slate-400 hover:text-white text-xl"><i class="fa-solid fa-xmark"></i></button>
       </div>
 
-      <input type="hidden" id="acc_id">
-      
-      <div class="space-y-4 text-xs">
-        <div>
-          <label class="block text-slate-300 font-medium mb-1">所属平台:</label>
-          <select id="acc_platform" onchange="togglePlatformFields()" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
-            <option value="codebuddy">腾讯 CodeBuddy / WorkBuddy</option>
-            <option value="trae">字节跳动 TRAE CN (SOLO)</option>
-          </select>
+      <!-- 选项卡切换 -->
+      <div class="flex border-b border-slate-700/60 pb-3 gap-2">
+        <button type="button" id="tab_btn_smart" onclick="switchModalTab('smart')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-wand-magic-sparkles text-amber-300"></i> 🌐 网页扫码 / 书签秒导 (推荐)
+        </button>
+        <button type="button" id="tab_btn_manual" onclick="switchModalTab('manual')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-keyboard"></i> 📋 智能粘贴 / 手动录入
+        </button>
+        <button type="button" id="tab_btn_local" onclick="switchModalTab('local')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-laptop-code"></i> 💻 本机客户端一键探测
+        </button>
+      </div>
+
+      <!-- 内容区 1：网页扫码 / 书签秒导 (强烈推荐) -->
+      <div id="tab_content_smart" class="space-y-4 text-xs">
+        <div class="p-4 bg-gradient-to-r from-blue-900/40 via-indigo-900/40 to-slate-900 rounded-xl border border-indigo-500/30 space-y-2">
+          <div class="flex items-center gap-2 text-indigo-200 font-bold text-sm">
+            <i class="fa-solid fa-star text-amber-400"></i> 极速小号录入方式：网页登录 + 点一下书签秒同步
+          </div>
+          <p class="text-slate-300 leading-relaxed">
+            无需手动抓包或提取 Token！在浏览器打开官方网站（支持微信扫码或手机短信登录），登录成功后直接点击书签栏上的工具，当前小号即刻秒级录入到云端后台并开启每日定时签到。
+          </p>
         </div>
 
-        <div>
-          <label class="block text-slate-300 font-medium mb-1">账号备注 (区分小号):</label>
-          <input type="text" id="acc_remark" placeholder="例如: 毕书源 (主号)、日常写代码小号1..." class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
+        <div class="space-y-3">
+          <div class="font-semibold text-slate-200">第一步：将下方按钮拖到浏览器书签栏（只需拖一次，永久可用）</div>
+          <div class="p-3 bg-slate-900/80 rounded-xl border border-slate-700/60 flex flex-col sm:flex-row items-center justify-between gap-3">
+            <a id="bookmarkletLink" href="#" class="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-bold rounded-xl shadow-lg shadow-indigo-500/30 text-xs cursor-move transform active:scale-95 transition-all">
+              <i class="fa-solid fa-bookmark text-amber-300"></i> ⭐ 拖拽此按钮到书签栏：【一键导入 AI 管家】
+            </a>
+            <button onclick="copyBookmarkletCode()" class="text-xs text-indigo-300 hover:text-white px-3 py-1.5 glass rounded-lg flex items-center gap-1.5">
+              <i class="fa-solid fa-copy"></i> 复制 JS 脚本代码
+            </button>
+          </div>
+          <p class="text-[11px] text-slate-400">（如无法拖拽，可新建任意网页书签，将书签网址替换为复制的 JS 代码即可）</p>
+        </div>
+
+        <div class="space-y-3 pt-2">
+          <div class="font-semibold text-slate-200">第二步：在新窗口打开对应平台，登录你的大号或小号</div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <a href="https://www.codebuddy.cn/" target="_blank" class="p-3.5 bg-blue-950/40 hover:bg-blue-900/50 border border-blue-500/30 rounded-xl flex items-center justify-between text-blue-200 transition-all">
+              <div class="flex items-center gap-2.5">
+                <i class="fa-solid fa-code text-blue-400 text-base"></i>
+                <div>
+                  <div class="font-bold">打开 CodeBuddy / WorkBuddy 登录</div>
+                  <div class="text-[11px] text-blue-300/70">支持微信扫码 / 手机号验证码</div>
+                </div>
+              </div>
+              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-blue-400"></i>
+            </a>
+
+            <a href="https://www.trae.ai/" target="_blank" class="p-3.5 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 rounded-xl flex items-center justify-between text-purple-200 transition-all">
+              <div class="flex items-center gap-2.5">
+                <i class="fa-solid fa-brain text-purple-400 text-base"></i>
+                <div>
+                  <div class="font-bold">打开 TRAE 登录页</div>
+                  <div class="text-[11px] text-purple-300/70">支持抖音 / 手机扫码登录</div>
+                </div>
+              </div>
+              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-purple-400"></i>
+            </a>
+          </div>
+        </div>
+
+        <div class="space-y-2 pt-2">
+          <div class="font-semibold text-slate-200">第三步：登录完成后，直接在当前标签页点击书签</div>
+          <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-800 text-[11px] text-slate-400">
+            点击书签后，浏览器将弹出提示：“🎉 恭喜！账号已成功录入云端定时签到池！”。回到本页面刷新即可看到新小号与实时积分！多个小号只需在官方网站切换账号并再次点击书签即可。
+          </div>
+        </div>
+      </div>
+
+      <!-- 内容区 2：智能粘贴 / 手动录入 -->
+      <div id="tab_content_manual" class="space-y-4 text-xs hidden">
+        <input type="hidden" id="acc_id">
+        
+        <!-- 智能粘贴识别区 -->
+        <div class="p-3.5 bg-slate-900/80 rounded-xl border border-dashed border-indigo-500/40 space-y-2">
+          <div class="flex justify-between items-center">
+            <span class="font-bold text-indigo-300"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i> 智能粘贴板 (自动解析平台、手机号与凭据)</span>
+            <span class="text-[10px] text-slate-400">直接粘贴 JWT / JSON / 复制文本</span>
+          </div>
+          <textarea id="acc_smart_paste" rows="2" oninput="handleSmartPaste(this.value)" placeholder="直接在此粘贴整段 JWT Token 或 JSON 对象，系统将自动识别并填充下方表单..." class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono text-[11px]"></textarea>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-slate-300 font-medium mb-1">所属平台:</label>
+            <select id="acc_platform" onchange="togglePlatformFields()" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
+              <option value="codebuddy">腾讯 CodeBuddy / WorkBuddy</option>
+              <option value="trae">字节跳动 TRAE CN (SOLO)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-slate-300 font-medium mb-1">账号备注 (区分小号):</label>
+            <input type="text" id="acc_remark" placeholder="例如: 毕书源 (主号)、日常小号1..." class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
+          </div>
         </div>
 
         <div>
           <label class="block text-slate-300 font-medium mb-1">绑定手机号 / 标识 (用于大屏醒目标识，CodeBuddy 可留空自动提取):</label>
-          <input type="text" id="acc_phone" placeholder="例如: 13032213110 或 1850175526" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+          <input type="text" id="acc_phone" placeholder="例如: 13032213110" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
         </div>
 
         <div>
           <div class="flex justify-between items-center mb-1">
             <label class="text-slate-300 font-medium">AccessToken (访问凭据):</label>
-            <span id="tokenHelpLink" class="text-indigo-400 hover:underline cursor-pointer">快捷获取指引</span>
+            <span class="text-slate-400 text-[11px]">支持 Bearer eyJ...</span>
           </div>
-          <textarea id="acc_token" rows="4" placeholder="粘贴该账号的 accessToken / JWT 凭证..." class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono text-[11px]"></textarea>
+          <textarea id="acc_token" rows="3" placeholder="粘贴账号的 accessToken / JWT 凭证..." class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono text-[11px]"></textarea>
         </div>
 
         <!-- TRAE 专属字段 -->
@@ -615,22 +765,41 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-800 text-[11px] text-slate-400 space-y-1">
-          <p><i class="fa-solid fa-lightbulb text-amber-400 mr-1"></i> <b>提示</b>：点击保存时，服务端会自动联网验证该凭据的有效性并获取最新积分！</p>
-          <p>也可以在本地电脑直接运行 <code>python local_extract.py</code> 自动提取并一键推送到此服务端！</p>
+        <div class="flex justify-end gap-3 pt-3 border-t border-slate-700/60">
+          <button onclick="closeAccountModal()" class="px-5 py-2 glass hover:bg-slate-700/50 rounded-xl text-slate-300 text-xs">取消</button>
+          <button onclick="saveAccount()" id="saveAccBtn" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl text-xs transition-all flex items-center gap-2">
+            <i class="fa-solid fa-floppy-disk"></i> 验证并保存到服务器
+          </button>
         </div>
       </div>
 
-      <div class="flex justify-end gap-3 pt-4 border-t border-slate-700/60">
-        <button onclick="closeAccountModal()" class="px-5 py-2 glass hover:bg-slate-700/50 rounded-xl text-slate-300 text-xs">取消</button>
-        <button onclick="saveAccount()" id="saveAccBtn" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl text-xs transition-all flex items-center gap-2">
-          <i class="fa-solid fa-floppy-disk"></i> 验证并保存到服务器
-        </button>
+      <!-- 内容区 3：本机客户端全自动探测同步 -->
+      <div id="tab_content_local" class="space-y-4 text-xs hidden">
+        <div class="p-4 bg-slate-900/80 rounded-xl border border-slate-800 space-y-3">
+          <div class="font-bold text-slate-200 flex items-center gap-2 text-sm">
+            <i class="fa-solid fa-desktop text-indigo-400"></i> 本机客户端一键自动探测推送
+          </div>
+          <p class="text-slate-300 leading-relaxed">
+            如果你的电脑上安装并登录了 <b>WorkBuddy</b>、<b>CodeBuddy</b> 或 <b>TRAE CN / SOLO</b> 客户端，直接在项目目录下运行以下命令，即可全自动提取全部已登录账号并同步至本云端后台：
+          </p>
+          <div class="p-3 bg-slate-950 rounded-lg border border-slate-700 flex items-center justify-between gap-2 font-mono text-emerald-400">
+            <span id="localCmdText">python local_extract.py --push</span>
+            <button onclick="copyLocalCommand()" class="text-slate-400 hover:text-white px-2 py-1 glass rounded text-xs flex items-center gap-1">
+              <i class="fa-solid fa-copy"></i> 复制
+            </button>
+          </div>
+          <ul class="list-disc list-inside text-slate-400 space-y-1">
+            <li>自动提取 WorkBuddy/CodeBuddy JWT，提取手机号、昵称与 UID；</li>
+            <li>内置纯 Python AES 自解密算法，自动读取 TRAE 本地 LevelDB 会话凭据；</li>
+            <li>提取后自动发起 API 校验，并直接推送到本服务器保存。</li>
+          </ul>
+        </div>
       </div>
+
     </div>
   </div>
 
-  <!-- 模态框 2：系统配置中心 -->
+  <!-- 模态框 2：系统设置 -->
   <div id="settingsModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
     <div class="glass max-w-xl w-full p-6 md:p-8 rounded-2xl shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto custom-scroll">
       <div class="flex justify-between items-center border-b border-slate-700/60 pb-4">
@@ -640,19 +809,19 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="space-y-4 text-xs">
         <div>
-          <label class="block text-slate-300 font-medium mb-1">安全访问密码 / Secret Key:</label>
-          <input type="text" id="cfg_admin_key" placeholder="设置复杂的自定义访问密钥 (访问时在网址后加 ?key=你的密钥)" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
-          <p class="text-[11px] text-slate-400 mt-1"><i class="fa-solid fa-shield-halved text-emerald-400 mr-1"></i> 启用物理阻断保护：任何未携带正确密钥的陌生请求将被立即切断连接 (ERR_CONNECTION_CLOSED)，对外彻底隐身，不泄露任何服务信息。</p>
+          <label class="block text-slate-300 font-medium mb-1">安全访问密钥 / Secret Key:</label>
+          <input type="text" id="cfg_admin_key" placeholder="设置后台访问防伪密钥" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+          <p class="text-[11px] text-slate-400 mt-1">外部访客无此密钥时，连接将被物理直接阻断（ERR_EMPTY_RESPONSE），完全隐身隐藏服务。</p>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <label class="block text-slate-300 font-medium mb-1">每日定时签到时间 (小时 0-23):</label>
-            <input type="number" id="cfg_sched_hour" min="0" max="23" value="9" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+            <label class="block text-slate-300 font-medium mb-1">每日定时签到 (小时 0-23):</label>
+            <input type="number" id="cfg_sched_hour" min="0" max="23" value="9" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
           </div>
           <div>
-            <label class="block text-slate-300 font-medium mb-1">签到时间 (分钟 0-59):</label>
-            <input type="number" id="cfg_sched_min" min="0" max="59" value="0" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+            <label class="block text-slate-300 font-medium mb-1">每日定时签到 (分钟 0-59):</label>
+            <input type="number" id="cfg_sched_min" min="0" max="59" value="0" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
           </div>
         </div>
       </div>
@@ -668,6 +837,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <script>
     let globalData = null;
+    let currentAdminKey = '';
 
     async function loadData() {
       try {
@@ -697,6 +867,48 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
+    // 动态生成并设置书签栏代码
+    async function setupBookmarklet() {
+      try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        currentAdminKey = cfg.auth?.admin_key || 'Hub_98bxy_Sec2026';
+        const hubOrigin = window.location.origin;
+
+        // 构造书签执行脚本 (跨域 POST 到本服务器 /api/account/save)
+        const bmScript = `javascript:(function(){try{var t='';var p=location.host.indexOf('trae')!==-1?'trae':'codebuddy';for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k);if(v&&(v.indexOf('eyJ')===0||v.indexOf('accessToken')!==-1)){try{var j=JSON.parse(v);t=j.accessToken||j.token||t;}catch(e){if(v.indexOf('eyJ')===0)t=v;}}}for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i),v=sessionStorage.getItem(k);if(v&&(v.indexOf('eyJ')===0||v.indexOf('accessToken')!==-1)){try{var j=JSON.parse(v);t=j.accessToken||j.token||t;}catch(e){if(v.indexOf('eyJ')===0)t=v;}}}if(!t){var m=document.cookie.match(/(?:accessToken|token|jwt)=([^;]+)/);if(m)t=decodeURIComponent(m[1]);}if(!t){alert('未在当前页面检测到已登录的 Token，请在网页完成登录后重试！');return;}fetch('${hubOrigin}/api/account/save?key=${currentAdminKey}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:p,accessToken:t,remark:'网页一键导入 '+new Date().toLocaleDateString()})}).then(function(r){return r.json();}).then(function(d){if(d.success){alert('🎉 恭喜！当前账号已成功录入【AI 算力与积分智能管家】云端定时签到池！');}else{alert('导入失败: '+(d.error||d.message));}}).catch(function(e){alert('请求失败: '+e);});}catch(err){alert('提取失败: '+err);}})();`;
+
+        const bLink = document.getElementById('bookmarkletLink');
+        if (bLink) {
+          bLink.setAttribute('href', bmScript);
+          bLink.setAttribute('data-script', bmScript);
+        }
+      } catch (e) {
+        console.error('设置书签异常:', e);
+      }
+    }
+
+    function copyBookmarkletCode() {
+      const bLink = document.getElementById('bookmarkletLink');
+      const script = bLink ? bLink.getAttribute('data-script') : '';
+      if (!script) {
+        alert('正在生成书签脚本，请稍候点击');
+        return;
+      }
+      navigator.clipboard.writeText(script).then(() => {
+        alert('✅ 书签 JS 脚本已成功复制到剪贴板！可直接粘贴至浏览器地址栏或新建书签。');
+      }).catch(err => {
+        prompt('请手动全选复制以下脚本：', script);
+      });
+    }
+
+    function copyLocalCommand() {
+      const cmd = document.getElementById('localCmdText').innerText;
+      navigator.clipboard.writeText(cmd).then(() => {
+        alert('✅ 本地同步命令已复制：' + cmd);
+      });
+    }
+
     function renderAccounts(platform, accounts, container) {
       container.innerHTML = '';
       if (!accounts || accounts.length === 0) {
@@ -704,9 +916,14 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="col-span-full glass-card p-8 rounded-2xl text-center border-dashed border-2 border-slate-700/60">
             <div class="text-3xl text-slate-600 mb-2"><i class="fa-regular fa-folder-open"></i></div>
             <p class="text-sm text-slate-400">暂未添加任何 ${platform === 'codebuddy' ? 'CodeBuddy' : 'TRAE'} 账号</p>
-            <button onclick="openAddAccountModal('${platform}')" class="mt-4 px-4 py-2 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white rounded-xl text-xs transition-all">
-              <i class="fa-solid fa-plus mr-1"></i> 立即添加此平台账号
-            </button>
+            <div class="mt-4 flex items-center justify-center gap-3">
+              <button onclick="openLoginHelperModal('${platform}')" class="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-500/20 transition-all">
+                <i class="fa-solid fa-qrcode mr-1"></i> 扫码 / 快捷登录
+              </button>
+              <button onclick="openAddAccountModal('${platform}')" class="px-4 py-2 glass hover:bg-slate-700/50 text-slate-300 hover:text-white rounded-xl text-xs transition-all">
+                <i class="fa-solid fa-plus mr-1"></i> 手动录入
+              </button>
+            </div>
           </div>
         `;
         return;
@@ -743,7 +960,10 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
 
             <div class="my-3 p-4 rounded-xl bg-slate-900/60 border border-slate-800">
-              <div class="text-xs text-slate-400">当前可用剩余积分 / 算力</div>
+              <div class="text-xs text-slate-400 flex justify-between items-center">
+                <span>当前可用剩余积分 / 算力</span>
+                ${platform === 'codebuddy' ? `<span class="px-2 py-0.5 rounded text-[10px] bg-indigo-500/20 text-indigo-300 font-medium border border-indigo-500/30">${acc.plan_name || '体验版'}</span>` : ''}
+              </div>
               <div class="text-2xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-indigo-100 to-indigo-300 mt-1">
                 ${acc.credits} <span class="text-xs font-normal text-slate-400">Points</span>
               </div>
@@ -758,8 +978,9 @@ HTML_PAGE = """<!DOCTYPE html>
                   </div>
                 </div>
               ` : `
-                <div class="mt-2 text-[11px] text-slate-400">
-                  <span>${acc.status_text}</span>
+                <div class="mt-2 text-[11px] text-slate-400 flex items-center justify-between">
+                  <span>连签 ${acc.streak_days || 0} 天 · 累计签到所得 ${acc.total_earned || acc.credits}</span>
+                  <span class="text-emerald-400/80 text-[10px]">体验版可用</span>
                 </div>
               `}
             </div>
@@ -777,7 +998,7 @@ HTML_PAGE = """<!DOCTYPE html>
               <button onclick="checkinSingle('${platform}', '${acc.id}')" class="px-3 py-1 bg-emerald-600/30 hover:bg-emerald-600 text-emerald-300 hover:text-white rounded-lg transition-all flex items-center gap-1">
                 <i class="fa-solid fa-bolt"></i> 单独签到
               </button>
-              <button onclick="deleteAccount('${platform}', '${acc.id}')" class="px-2.5 py-1 glass hover:bg-rose-900/40 text-slate-400 hover:text-rose-300 rounded-lg transition-all">
+              <button onclick="deleteAccount('${platform}', '${acc.id}')" class="px-2.5 py-1 glass hover:bg-rose-900/40 text-slate-400 hover:text-rose-300 rounded-lg transition-all" title="删除账号">
                 <i class="fa-solid fa-trash-can"></i>
               </button>
             </div>
@@ -822,21 +1043,89 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     // 模态框控制
+    function openLoginHelperModal(platform = 'codebuddy') {
+      openAddAccountModal(platform);
+      switchModalTab('smart');
+    }
+
     function openAddAccountModal(platform = 'codebuddy') {
-      document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-user-plus text-indigo-400"></i> 添加 AI 账号';
+      document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与管理 AI 账号';
       document.getElementById('acc_id').value = '';
       document.getElementById('acc_platform').value = platform;
       document.getElementById('acc_remark').value = '';
       document.getElementById('acc_phone').value = '';
       document.getElementById('acc_token').value = '';
+      document.getElementById('acc_smart_paste').value = '';
       document.getElementById('acc_trae_uid').value = '';
       document.getElementById('acc_trae_did').value = '766820083601979';
       togglePlatformFields();
+      switchModalTab('smart');
       document.getElementById('accountModal').classList.remove('hidden');
     }
 
     function closeAccountModal() {
       document.getElementById('accountModal').classList.add('hidden');
+    }
+
+    function switchModalTab(tab) {
+      const tabs = ['smart', 'manual', 'local'];
+      tabs.forEach(t => {
+        const btn = document.getElementById(`tab_btn_${t}`);
+        const content = document.getElementById(`tab_content_${t}`);
+        if (t === tab) {
+          btn.className = "px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all flex items-center gap-1.5";
+          content.classList.remove('hidden');
+        } else {
+          btn.className = "px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5";
+          content.classList.add('hidden');
+        }
+      });
+    }
+
+    function handleSmartPaste(val) {
+      val = (val || '').trim();
+      if (!val) return;
+      try {
+        // 尝试解析 JSON
+        if (val.startsWith('{') && val.endsWith('}')) {
+          const j = JSON.parse(val);
+          if (j.accessToken) document.getElementById('acc_token').value = j.accessToken;
+          if (j.phone) document.getElementById('acc_phone').value = j.phone;
+          if (j.remark || j.nickname) document.getElementById('acc_remark').value = j.remark || j.nickname;
+          if (j.platform) {
+            document.getElementById('acc_platform').value = j.platform;
+            togglePlatformFields();
+          }
+          if (j.uid) document.getElementById('acc_trae_uid').value = j.uid;
+          return;
+        }
+      } catch (e) {}
+
+      // 提取 Bearer Token 或 JWT
+      if (val.includes('eyJ')) {
+        let token = val;
+        if (token.startsWith('Bearer ')) token = token.slice(7).trim();
+        document.getElementById('acc_token').value = token;
+        
+        // 尝试解码 JWT claims
+        try {
+          const parts = token.split('.');
+          if (parts.length >= 2) {
+            const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            const payload = JSON.parse(decodeURIComponent(escape(atob(b64))));
+            if (payload.preferred_username) {
+              document.getElementById('acc_phone').value = payload.preferred_username;
+            }
+            if (payload.nickname && !document.getElementById('acc_remark').value) {
+              document.getElementById('acc_remark').value = payload.nickname;
+            }
+            if (payload.iss && payload.iss.includes('codebuddy')) {
+              document.getElementById('acc_platform').value = 'codebuddy';
+              togglePlatformFields();
+            }
+          }
+        } catch (e) {}
+      }
     }
 
     function togglePlatformFields() {
@@ -879,14 +1168,14 @@ HTML_PAGE = """<!DOCTYPE html>
         });
         const d = await res.json();
         if (d.success) {
-          alert('账号验证成功并已保存！');
+          alert('🎉 账号验证成功，已保存到云端定时签到池！');
           closeAccountModal();
           loadData();
         } else {
           alert('保存失败: ' + (d.error || d.message));
         }
       } catch (e) {
-        alert('网络错误: ' + e);
+        alert('请求错误: ' + e);
       } finally {
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 验证并保存到服务器';
@@ -894,7 +1183,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function deleteAccount(platform, id) {
-      if (!confirm('确定要删除此账号吗？')) return;
+      if (!confirm('确定要删除该账号吗？')) return;
       try {
         const res = await fetch('/api/account/delete', {
           method: 'POST',
@@ -908,7 +1197,7 @@ HTML_PAGE = """<!DOCTYPE html>
           alert('删除失败: ' + d.error);
         }
       } catch (e) {
-        alert('请求失败: ' + e);
+        alert('操作失败: ' + e);
       }
     }
 
@@ -922,7 +1211,7 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById('cfg_sched_min').value = cfg.settings?.auto_checkin_minute ?? 0;
         document.getElementById('settingsModal').classList.remove('hidden');
       } catch (e) {
-        alert('读取配置失败');
+        alert('获取配置失败');
       }
     }
 
@@ -936,17 +1225,18 @@ HTML_PAGE = """<!DOCTYPE html>
       btn.innerHTML = '正在保存...';
       const payload = {
         admin_key: document.getElementById('cfg_admin_key').value.trim(),
-        auto_checkin_hour: parseInt(document.getElementById('cfg_sched_hour').value),
-        auto_checkin_minute: parseInt(document.getElementById('cfg_sched_min').value)
+        auto_checkin_hour: parseInt(document.getElementById('cfg_sched_hour').value, 10),
+        auto_checkin_minute: parseInt(document.getElementById('cfg_sched_min').value, 10)
       };
+
       try {
-        const res = await fetch('/api/system/save', {
+        const res = await fetch('/api/config/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const d = await res.json();
-        alert('系统设置已更新！');
+        alert(d.message || '系统设置已更新');
         closeSettingsModal();
         loadData();
       } catch (e) {
@@ -957,6 +1247,7 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
+    setupBookmarklet();
     loadData();
     setInterval(loadData, 20000);
   </script>
@@ -1009,6 +1300,15 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.close()
         except Exception:
             pass
+
+    def do_OPTIONS(self):
+        """处理跨域 OPTIONS 预检请求（支持书签跨域导入）"""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Hub-Key")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def do_HEAD(self):
         if not self.check_auth():
@@ -1101,6 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
             update_cache()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "message": res_msg}, ensure_ascii=False).encode("utf-8"))
 
@@ -1108,6 +1409,8 @@ class Handler(BaseHTTPRequestHandler):
             platform = body.get("platform")
             if platform not in ("codebuddy", "trae"):
                 self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": False, "error": "不支持的平台"}).encode("utf-8"))
                 return
@@ -1117,6 +1420,15 @@ class Handler(BaseHTTPRequestHandler):
             if key_name not in cfg:
                 cfg[key_name] = []
 
+            token = body.get("accessToken", "").strip()
+            if not token:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Token 不能为空"}).encode("utf-8"))
+                return
+
             acc_id = body.get("id")
             if not acc_id:
                 acc_id = f"{platform}_{uuid.uuid4().hex[:8]}"
@@ -1125,7 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": acc_id,
                 "remark": body.get("remark") or "账号",
                 "phone": body.get("phone", "").strip(),
-                "accessToken": body.get("accessToken", "").strip(),
+                "accessToken": token,
                 "enabled": True
             }
 
@@ -1134,20 +1446,23 @@ class Handler(BaseHTTPRequestHandler):
                 test_res = fetch_single_codebuddy(account_data)
                 if not test_res.get("valid"):
                     self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.wfile.write(json.dumps({"success": False, "error": f"Token 校验失败: {test_res.get('status_text')}"}).encode("utf-8"))
                     return
                 account_data["nickname"] = test_res.get("nickname") or account_data["remark"]
                 if not account_data["phone"] and test_res.get("phone"):
                     account_data["phone"] = test_res.get("phone")
+                account_data["uid"] = test_res.get("uid") or ""
             elif platform == "trae":
                 account_data["uid"] = str(body.get("uid", "")).strip()
                 account_data["deviceId"] = body.get("deviceId", "766820083601979").strip()
                 test_res = fetch_single_trae(account_data)
                 if not test_res.get("valid"):
                     self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.wfile.write(json.dumps({"success": False, "error": f"Token 校验失败: {test_res.get('status_text')}"}).encode("utf-8"))
                     return
@@ -1165,6 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
             update_cache()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "id": acc_id}).encode("utf-8"))
 
@@ -1179,12 +1495,13 @@ class Handler(BaseHTTPRequestHandler):
                 update_cache()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
 
-        elif p == "/api/system/save":
+        elif p == "/api/config/save":
             cfg = load_config()
-            if "admin_key" in body:
+            if "admin_key" in body and body["admin_key"]:
                 cfg["auth"]["admin_key"] = body["admin_key"].strip()
             if "auto_checkin_hour" in body:
                 cfg["settings"]["auto_checkin_hour"] = int(body["auto_checkin_hour"])
@@ -1194,8 +1511,9 @@ class Handler(BaseHTTPRequestHandler):
             update_cache()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            self.wfile.write(json.dumps({"success": True, "message": "配置保存成功！"}).encode("utf-8"))
 
         else:
             self.send_response(404)
@@ -1205,14 +1523,22 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 def main():
-    t = threading.Thread(target=scheduler_thread, daemon=True)
+    load_config()
+    update_cache()
+
+    t = threading.Thread(target=scheduler_worker, daemon=True)
     t.start()
+
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"==========================================================")
-    log(f"  🚀 AI-Credits-Hub (多账号版) 已启动，端口: {PORT}")
-    log(f"  🌐 访问地址: http://127.0.0.1:{PORT}")
-    log(f"==========================================================")
-    server.serve_forever()
+    print("=" * 65)
+    print(f"  AI-Credits-Hub (多账号版) 运行中...")
+    print(f"  本地服务地址: http://127.0.0.1:{PORT}")
+    print(f"  安全访问密钥: Hub_98bxy_Sec2026")
+    print("=" * 65)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[退出] 服务已停止")
 
 if __name__ == "__main__":
     main()
