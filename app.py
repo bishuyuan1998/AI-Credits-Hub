@@ -1403,6 +1403,68 @@ class Handler(BaseHTTPRequestHandler):
             rendered_page = HTML_PAGE.replace("{{ADMIN_KEY}}", admin_key)
             self.wfile.write(rendered_page.encode("utf-8"))
 
+        elif p == "/api/download/sync-bat":
+            host = self.headers.get("Host", f"47.77.190.116:{PORT}")
+            bat_code = f"""@echo off
+chcp 65001 >nul
+title AI-Credits-Hub 本机账号一键同步
+echo ================================================================
+echo       AI 算力与积分智能管家 · 本机账号一键同步
+echo ================================================================
+echo.
+echo 正在自动探测本机 CodeBuddy / WorkBuddy 和 TRAE 客户端凭据...
+echo.
+
+python -c "
+import urllib.request, json, os, re, sys
+
+# 1. 探测 CodeBuddy
+try:
+    p = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'Tencent-Cloud.coding-copilot.info')
+    if os.path.exists(p):
+        d = json.load(open(p, encoding='utf-8'))
+        t = d.get('auth', {{}}).get('accessToken')
+        if t:
+            req = urllib.request.Request('http://{host}/api/account/save?key={admin_key}', data=json.dumps({{'platform':'codebuddy', 'accessToken':t, 'remark':'本机 CodeBuddy ('+d.get('account',{{}}).get('nickname','主号')+')'}}).encode('utf-8'), headers={{'Content-Type':'application/json'}})
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
+            opener.open(req, timeout=10)
+            print('[OK] 成功同步 CodeBuddy / WorkBuddy 账号')
+except Exception as e:
+    print('CodeBuddy:', e)
+
+# 2. 探测 TRAE
+try:
+    candidates = [
+        os.path.join(os.environ.get('APPDATA', ''), 'TRAE SOLO CN', 'User', 'globalStorage', 'storage.json'),
+        os.path.join(os.environ.get('APPDATA', ''), 'Trae CN', 'User', 'globalStorage', 'storage.json')
+    ]
+    for sp in candidates:
+        if os.path.exists(sp):
+            d = json.load(open(sp, encoding='utf-8'))
+            m = re.search(r'\\\"token\\\"\\\\s*:\\\\s*\\\"([^\\\"]+)\\\"', open(sp, encoding='utf-8', errors='ignore').read())
+            if m:
+                t = m.group(1)
+                req = urllib.request.Request('http://{host}/api/account/save?key={admin_key}', data=json.dumps({{'platform':'trae', 'accessToken':t, 'remark':'本机 TRAE 客户端'}}).encode('utf-8'), headers={{'Content-Type':'application/json'}})
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
+                opener.open(req, timeout=10)
+                print('[OK] 成功同步 TRAE 账号')
+                break
+except Exception as e:
+    print('TRAE:', e)
+"
+
+echo.
+echo ================================================================
+echo 同步完成！刷新网页控制台即可看到最新账号与算力。
+echo ================================================================
+pause
+"""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-bat; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="ai_sync.bat"')
+            self.end_headers()
+            self.wfile.write(bat_code.encode("utf-8"))
+
         elif p == "/api/data":
             force_refresh = query.get("refresh", [""])[0] in ("1", "true")
             cache_expired = (time.time() - CACHE_LAST_FETCH) > 5
