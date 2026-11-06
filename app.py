@@ -16,6 +16,7 @@ import time
 import uuid
 import datetime
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -405,15 +406,20 @@ def execute_all_checkin():
 #  缓存与后台调度器
 # ====================================================================
 DATA_CACHE = {}
+CACHE_LAST_FETCH = 0
 
 def update_cache():
-    global DATA_CACHE
+    global DATA_CACHE, CACHE_LAST_FETCH
     cfg = load_config()
     cb_accounts = cfg.get("codebuddy_accounts", [])
     trae_accounts = cfg.get("trae_accounts", [])
 
-    cb_res = [fetch_single_codebuddy(a) for a in cb_accounts]
-    trae_res = [fetch_single_trae(a) for a in trae_accounts]
+    # 使用多线程高并发并行查询所有账号，耗时由原来的累加变为并发 0.3s
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        cb_futures = [executor.submit(fetch_single_codebuddy, a) for a in cb_accounts]
+        trae_futures = [executor.submit(fetch_single_trae, a) for a in trae_accounts]
+        cb_res = [f.result() for f in cb_futures]
+        trae_res = [f.result() for f in trae_futures]
 
     total_acc = len(cb_res) + len(trae_res)
     checked_count = sum(1 for a in cb_res + trae_res if a.get("today_checked"))
@@ -431,6 +437,7 @@ def update_cache():
         "codebuddy_accounts": cb_res,
         "trae_accounts": trae_res
     }
+    CACHE_LAST_FETCH = time.time()
     return DATA_CACHE
 
 def scheduler_worker():
@@ -496,28 +503,29 @@ HTML_PAGE = """<!DOCTYPE html>
       
       <!-- 汇总状态胶囊 -->
       <div class="flex items-center gap-3 flex-wrap">
-        <div class="flex items-center gap-4 bg-slate-900/60 px-4 py-2 rounded-xl border border-slate-800 text-xs text-slate-300">
+        <div class="flex items-center gap-3 bg-slate-900/60 px-4 py-2 rounded-xl border border-slate-800 text-xs text-slate-300">
           <div>托管账号: <span id="stat_total" class="font-bold text-indigo-400">0</span></div>
           <div class="w-px h-3 bg-slate-700"></div>
           <div>今日已打卡: <span id="stat_checked" class="font-bold text-emerald-400">0</span></div>
           <div class="w-px h-3 bg-slate-700"></div>
           <div>累计可用算力: <span id="stat_credits" class="font-bold text-amber-300">0</span></div>
+          <div class="w-px h-3 bg-slate-700"></div>
+          <div id="stat_refresh_time" class="text-emerald-400 text-[11px] flex items-center gap-1">
+            <i class="fa-solid fa-circle text-[7px] animate-pulse"></i> 实时监控中
+          </div>
         </div>
 
         <button onclick="triggerCheckinAll()" id="checkinAllBtn" class="px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white font-medium rounded-xl shadow-lg shadow-emerald-500/20 flex items-center gap-2 text-sm transition-all transform active:scale-95">
           <i class="fa-solid fa-bolt"></i> 立即全平台签到
         </button>
-        <button onclick="openLoginHelperModal()" class="px-4 py-2.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-medium rounded-xl shadow-lg shadow-indigo-500/20 flex items-center gap-2 text-sm transition-all">
-          <i class="fa-solid fa-right-to-bracket"></i> 快捷登录 / 录入小号
-        </button>
-        <button onclick="openAddAccountModal()" class="px-3.5 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 hover:text-white font-medium rounded-xl text-sm transition-all flex items-center gap-1.5" title="手动录入账号">
-          <i class="fa-solid fa-plus"></i> 添加
+        <button onclick="openAddAccountModal()" class="px-4 py-2.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-medium rounded-xl shadow-lg shadow-indigo-500/20 flex items-center gap-2 text-sm transition-all">
+          <i class="fa-solid fa-user-plus"></i> 添加 / 快捷同步账号
         </button>
         <button onclick="openSettingsModal()" class="p-2.5 glass hover:bg-slate-700/50 rounded-xl text-slate-300 hover:text-white text-sm" title="系统与凭证设置">
           <i class="fa-solid fa-gear"></i>
         </button>
-        <button onclick="loadData()" class="p-2.5 glass hover:bg-slate-700/50 rounded-xl text-slate-300 hover:text-white text-sm" title="刷新数据">
-          <i class="fa-solid fa-rotate-right"></i>
+        <button onclick="loadData(true)" id="refreshBtn" class="p-2.5 glass hover:bg-slate-700/50 rounded-xl text-slate-300 hover:text-white text-sm" title="重新从平台查询最新实时算力">
+          <i id="refreshIcon" class="fa-solid fa-rotate-right"></i>
         </button>
       </div>
     </header>
@@ -627,88 +635,78 @@ HTML_PAGE = """<!DOCTYPE html>
     </footer>
   </div>
 
-  <!-- 模态框：添加 / 编辑账号 / 网页快捷登录 (多功能集合) -->
+  <!-- 模态框：添加 / 编辑账号 / 快捷同步 -->
   <div id="accountModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
     <div class="glass max-w-2xl w-full p-6 md:p-8 rounded-2xl shadow-2xl space-y-6 max-h-[92vh] overflow-y-auto custom-scroll">
       
       <div class="flex justify-between items-center border-b border-slate-700/60 pb-4">
         <div>
           <h3 id="accModalTitle" class="text-lg font-bold text-white flex items-center gap-2">
-            <i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与管理 AI 账号
+            <i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与同步 AI 账号
           </h3>
-          <p class="text-xs text-slate-400 mt-0.5">支持网页扫码秒导、本地客户端提取、或智能粘贴录入</p>
+          <p class="text-xs text-slate-400 mt-0.5">支持本机客户端一键极速同步、智能粘贴或网页控制台秒录</p>
         </div>
         <button onclick="closeAccountModal()" class="text-slate-400 hover:text-white text-xl"><i class="fa-solid fa-xmark"></i></button>
       </div>
 
-      <!-- 选项卡切换 -->
+      <!-- 选项卡切换 (默认展示最省心的本机一键同步) -->
       <div class="flex border-b border-slate-700/60 pb-3 gap-2">
-        <button type="button" id="tab_btn_smart" onclick="switchModalTab('smart')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all flex items-center gap-1.5">
-          <i class="fa-solid fa-wand-magic-sparkles text-amber-300"></i> 🌐 网页扫码 / 书签秒导 (推荐)
+        <button type="button" id="tab_btn_local" onclick="switchModalTab('local')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-laptop-code text-amber-300"></i> 💻 电脑客户端一键同步 (最推荐)
         </button>
         <button type="button" id="tab_btn_manual" onclick="switchModalTab('manual')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5">
-          <i class="fa-solid fa-keyboard"></i> 📋 智能粘贴 / 手动录入
+          <i class="fa-solid fa-wand-magic-sparkles"></i> 📋 智能粘贴 / 快捷录入
         </button>
-        <button type="button" id="tab_btn_local" onclick="switchModalTab('local')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5">
-          <i class="fa-solid fa-laptop-code"></i> 💻 本机客户端一键探测
+        <button type="button" id="tab_btn_web" onclick="switchModalTab('web')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-globe"></i> 🌐 网页 1 秒代码抓取 (免拖书签)
         </button>
       </div>
 
-      <!-- 内容区 1：网页扫码 / 书签秒导 (强烈推荐) -->
-      <div id="tab_content_smart" class="space-y-4 text-xs">
-        <div class="p-4 bg-gradient-to-r from-blue-900/40 via-indigo-900/40 to-slate-900 rounded-xl border border-indigo-500/30 space-y-2">
-          <div class="flex items-center gap-2 text-indigo-200 font-bold text-sm">
-            <i class="fa-solid fa-star text-amber-400"></i> 极速小号录入方式：网页登录 + 点一下书签秒同步
+      <!-- 内容区 1：本机客户端全自动一键同步 (默认最简单推荐) -->
+      <div id="tab_content_local" class="space-y-4 text-xs">
+        <div class="p-4 bg-gradient-to-r from-emerald-950/40 via-teal-950/40 to-slate-900 rounded-xl border border-emerald-500/30 space-y-3">
+          <div class="flex items-center gap-2 text-emerald-300 font-bold text-sm">
+            <i class="fa-solid fa-bolt text-amber-400"></i> 零门槛操作：电脑客户端已登录，一键直连同步
           </div>
           <p class="text-slate-300 leading-relaxed">
-            无需手动抓包或提取 Token！在浏览器打开官方网站（支持微信扫码或手机短信登录），登录成功后直接点击书签栏上的工具，当前小号即刻秒级录入到云端后台并开启每日定时签到。
+            只要你的电脑上安装并登录过 <b>腾讯 CodeBuddy / WorkBuddy</b> 或 <b>字节跳动 TRAE CN / SOLO</b> 客户端，无需手动复制 Token 或密码，工具将自动自解密读取凭据并推送到本云端！
           </p>
         </div>
 
-        <div class="space-y-3">
-          <div class="font-semibold text-slate-200">第一步：将下方按钮拖到浏览器书签栏（只需拖一次，永久可用）</div>
-          <div class="p-3 bg-slate-900/80 rounded-xl border border-slate-700/60 flex flex-col sm:flex-row items-center justify-between gap-3">
-            <a id="bookmarkletLink" href="#" class="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-bold rounded-xl shadow-lg shadow-indigo-500/30 text-xs cursor-move transform active:scale-95 transition-all">
-              <i class="fa-solid fa-bookmark text-amber-300"></i> ⭐ 拖拽此按钮到书签栏：【一键导入 AI 管家】
-            </a>
-            <button onclick="copyBookmarkletCode()" class="text-xs text-indigo-300 hover:text-white px-3 py-1.5 glass rounded-lg flex items-center gap-1.5">
-              <i class="fa-solid fa-copy"></i> 复制 JS 脚本代码
+        <!-- 方案 A：本地已有项目直接双击 -->
+        <div class="p-4 bg-slate-900/80 rounded-xl border border-slate-700/70 space-y-2.5">
+          <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-200 flex items-center gap-2">
+              <span class="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-[11px] font-bold">1</span>
+              在本地项目直接双击（最快）
+            </span>
+            <span class="text-[11px] text-emerald-400 font-medium">已预装好脚本</span>
+          </div>
+          <p class="text-slate-400 leading-relaxed text-[11px]">
+            在本地项目文件夹 <code class="text-indigo-300 bg-slate-950 px-1.5 py-0.5 rounded font-mono">D:/yinhai/project/AI-Credits-Hub</code> 中，直接双击运行：
+          </p>
+          <div class="p-2.5 bg-slate-950 rounded-lg border border-indigo-500/30 flex items-center justify-between text-indigo-300 font-mono text-xs">
+            <span>👉 【双击一键同步账号到云端】.bat</span>
+            <span class="text-slate-500 text-[11px]">双击即自动提取并同步全部账号</span>
+          </div>
+        </div>
+
+        <!-- 方案 B：下载通用同步工具 -->
+        <div class="p-4 bg-slate-900/80 rounded-xl border border-slate-700/70 space-y-2.5">
+          <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-200 flex items-center gap-2">
+              <span class="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-[11px] font-bold">2</span>
+              在任意安装了客户端的电脑上一键同步
+            </span>
+          </div>
+          <p class="text-slate-400 text-[11px]">点击下方按钮下载预先配置好本服务器密钥的同步脚本，下载后直接双击即可：</p>
+          <div class="flex items-center gap-3">
+            <button onclick="downloadSyncBat()" class="px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-medium rounded-xl shadow-lg shadow-indigo-500/20 flex items-center gap-2 transition-all">
+              <i class="fa-solid fa-download"></i> 立即下载一键同步脚本 (ai_sync.bat)
             </button>
-          </div>
-          <p class="text-[11px] text-slate-400">（如无法拖拽，可新建任意网页书签，将书签网址替换为复制的 JS 代码即可）</p>
-        </div>
-
-        <div class="space-y-3 pt-2">
-          <div class="font-semibold text-slate-200">第二步：在新窗口打开对应平台，登录你的大号或小号</div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <a href="https://www.codebuddy.cn/" target="_blank" class="p-3.5 bg-blue-950/40 hover:bg-blue-900/50 border border-blue-500/30 rounded-xl flex items-center justify-between text-blue-200 transition-all">
-              <div class="flex items-center gap-2.5">
-                <i class="fa-solid fa-code text-blue-400 text-base"></i>
-                <div>
-                  <div class="font-bold">打开 CodeBuddy / WorkBuddy 登录</div>
-                  <div class="text-[11px] text-blue-300/70">支持微信扫码 / 手机号验证码</div>
-                </div>
-              </div>
-              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-blue-400"></i>
-            </a>
-
-            <a href="https://www.trae.ai/" target="_blank" class="p-3.5 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 rounded-xl flex items-center justify-between text-purple-200 transition-all">
-              <div class="flex items-center gap-2.5">
-                <i class="fa-solid fa-brain text-purple-400 text-base"></i>
-                <div>
-                  <div class="font-bold">打开 TRAE 登录页</div>
-                  <div class="text-[11px] text-purple-300/70">支持抖音 / 手机扫码登录</div>
-                </div>
-              </div>
-              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-purple-400"></i>
-            </a>
-          </div>
-        </div>
-
-        <div class="space-y-2 pt-2">
-          <div class="font-semibold text-slate-200">第三步：登录完成后，直接在当前标签页点击书签</div>
-          <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-800 text-[11px] text-slate-400">
-            点击书签后，浏览器将弹出提示：“🎉 恭喜！账号已成功录入云端定时签到池！”。回到本页面刷新即可看到新小号与实时积分！多个小号只需在官方网站切换账号并再次点击书签即可。
+            <button onclick="copyLocalCommand()" class="px-4 py-2 glass hover:bg-slate-700/50 text-slate-300 hover:text-white rounded-xl flex items-center gap-1.5 transition-all">
+              <i class="fa-solid fa-terminal"></i> 复制 Python 命令
+            </button>
           </div>
         </div>
       </div>
@@ -718,12 +716,15 @@ HTML_PAGE = """<!DOCTYPE html>
         <input type="hidden" id="acc_id">
         
         <!-- 智能粘贴识别区 -->
-        <div class="p-3.5 bg-slate-900/80 rounded-xl border border-dashed border-indigo-500/40 space-y-2">
+        <div class="p-4 bg-slate-900/90 rounded-xl border border-dashed border-indigo-500/50 space-y-2">
           <div class="flex justify-between items-center">
-            <span class="font-bold text-indigo-300"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i> 智能粘贴板 (自动解析平台、手机号与凭据)</span>
-            <span class="text-[10px] text-slate-400">直接粘贴 JWT / JSON / 复制文本</span>
+            <span class="font-bold text-indigo-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-wand-magic-sparkles text-amber-300"></i> 极速智能粘贴板 (自动解析平台、手机号与凭据)
+            </span>
+            <span class="text-[10px] text-slate-400">贴入即自动填充</span>
           </div>
-          <textarea id="acc_smart_paste" rows="2" oninput="handleSmartPaste(this.value)" placeholder="直接在此粘贴整段 JWT Token 或 JSON 对象，系统将自动识别并填充下方表单..." class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono text-[11px]"></textarea>
+          <textarea id="acc_smart_paste" rows="3" oninput="handleSmartPaste(this.value)" placeholder="直接在此粘贴 Token、或在 F12 复制的整段 JWT、请求头、JSON，系统自动提取识别..." class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono text-[11px]"></textarea>
+          <div id="paste_status_hint" class="text-[11px] text-slate-400">💡 提示：支持粘贴 Bearer eyJ... 或包含 token 的任何文本。</div>
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -742,8 +743,8 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div>
-          <label class="block text-slate-300 font-medium mb-1">绑定手机号 / 标识 (用于大屏醒目标识，CodeBuddy 可留空自动提取):</label>
-          <input type="text" id="acc_phone" placeholder="例如: 13032213110" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
+          <label class="block text-slate-300 font-medium mb-1">绑定手机号 / 标识 (用于大屏醒目标识):</label>
+          <input type="text" id="acc_phone" placeholder="例如: 13032213110 (CodeBuddy 自动提取)" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
         </div>
 
         <div>
@@ -774,26 +775,40 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 内容区 3：本机客户端全自动探测同步 -->
-      <div id="tab_content_local" class="space-y-4 text-xs hidden">
+      <!-- 内容区 3：网页版快捷抓取 (完全免拖书签) -->
+      <div id="tab_content_web" class="space-y-4 text-xs hidden">
         <div class="p-4 bg-slate-900/80 rounded-xl border border-slate-800 space-y-3">
           <div class="font-bold text-slate-200 flex items-center gap-2 text-sm">
-            <i class="fa-solid fa-desktop text-indigo-400"></i> 本机客户端一键自动探测推送
+            <i class="fa-solid fa-globe text-blue-400"></i> 网页登录小号：免拖书签，2 步极速导入
           </div>
           <p class="text-slate-300 leading-relaxed">
-            如果你的电脑上安装并登录了 <b>WorkBuddy</b>、<b>CodeBuddy</b> 或 <b>TRAE CN / SOLO</b> 客户端，直接在项目目录下运行以下命令，即可全自动提取全部已登录账号并同步至本云端后台：
+            无需繁琐地把按钮拖到书签栏！直接在新标签页打开官网登录后，在控制台（Console）粘贴一行代码按回车，1 秒自动完成同步：
           </p>
-          <div class="p-3 bg-slate-950 rounded-lg border border-slate-700 flex items-center justify-between gap-2 font-mono text-emerald-400">
-            <span id="localCmdText">python local_extract.py --push</span>
-            <button onclick="copyLocalCommand()" class="text-slate-400 hover:text-white px-2 py-1 glass rounded text-xs flex items-center gap-1">
-              <i class="fa-solid fa-copy"></i> 复制
+        </div>
+
+        <div class="space-y-3">
+          <div class="font-semibold text-slate-200">第一步：在新窗口打开对应平台，登录你的小号</div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <a href="https://www.codebuddy.cn/" target="_blank" class="p-3 bg-blue-950/40 hover:bg-blue-900/50 border border-blue-500/30 rounded-xl flex items-center justify-between text-blue-200 transition-all">
+              <span class="font-bold"><i class="fa-solid fa-code mr-1.5 text-blue-400"></i> 打开 CodeBuddy 登录页</span>
+              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-blue-400"></i>
+            </a>
+            <a href="https://www.trae.ai/" target="_blank" class="p-3 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 rounded-xl flex items-center justify-between text-purple-200 transition-all">
+              <span class="font-bold"><i class="fa-solid fa-brain mr-1.5 text-purple-400"></i> 打开 TRAE 登录页</span>
+              <i class="fa-solid fa-arrow-up-right-from-square text-xs text-purple-400"></i>
+            </a>
+          </div>
+        </div>
+
+        <div class="space-y-2 pt-1">
+          <div class="font-semibold text-slate-200">第二步：登录后按 F12 打开控制台，粘贴复制这一行脚本并按回车</div>
+          <div class="p-3 bg-slate-950 rounded-xl border border-slate-700/80 flex items-center justify-between gap-3">
+            <span id="webSnippetText" class="font-mono text-indigo-300 text-[11px] truncate select-all"></span>
+            <button onclick="copyWebSnippet()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap">
+              <i class="fa-solid fa-copy"></i> 复制脚本代码
             </button>
           </div>
-          <ul class="list-disc list-inside text-slate-400 space-y-1">
-            <li>自动提取 WorkBuddy/CodeBuddy JWT，提取手机号、昵称与 UID；</li>
-            <li>内置纯 Python AES 自解密算法，自动读取 TRAE 本地 LevelDB 会话凭据；</li>
-            <li>提取后自动发起 API 校验，并直接推送到本服务器保存。</li>
-          </ul>
+          <p class="text-[11px] text-slate-400">回车后将自动提取网页登录凭证并弹出“🎉 同步成功”提示，回到本页面刷新即可！</p>
         </div>
       </div>
 
@@ -840,9 +855,12 @@ HTML_PAGE = """<!DOCTYPE html>
     let globalData = null;
     let currentAdminKey = '';
 
-    async function loadData() {
+    async function loadData(force = false) {
+      const icon = document.getElementById('refreshIcon');
+      if (icon) icon.classList.add('fa-spin');
       try {
-        const res = await fetch('/api/data');
+        const url = force ? '/api/data?refresh=1' : '/api/data';
+        const res = await fetch(url);
         if (res.status === 403) {
           location.reload();
           return;
@@ -855,6 +873,12 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById('stat_credits').innerText = globalData.summary.total_credits;
         document.getElementById('footer_sched_time').innerText = globalData.summary.scheduler_time;
 
+        const nowStr = new Date().toLocaleTimeString();
+        const refreshEl = document.getElementById('stat_refresh_time');
+        if (refreshEl) {
+          refreshEl.innerHTML = `<i class="fa-solid fa-circle text-[7px] text-emerald-400 animate-pulse"></i> 实时已更新于 ${nowStr}`;
+        }
+
         // 渲染 CodeBuddy
         renderAccounts('codebuddy', globalData.codebuddy_accounts, document.getElementById('codebuddyGrid'));
         document.getElementById('cb_count_badge').innerText = `${globalData.codebuddy_accounts.length} 个账号`;
@@ -865,48 +889,58 @@ HTML_PAGE = """<!DOCTYPE html>
 
       } catch (err) {
         console.error(err);
+      } finally {
+        if (icon) icon.classList.remove('fa-spin');
       }
     }
 
-    // 动态生成并设置书签栏代码
-    async function setupBookmarklet() {
+    // 初始化提取工具与命令
+    async function setupWebTools() {
       try {
         const res = await fetch('/api/config');
         const cfg = await res.json();
         currentAdminKey = cfg.auth?.admin_key || 'Hub_98bxy_Sec2026';
         const hubOrigin = window.location.origin;
 
-        // 构造书签执行脚本 (跨域 POST 到本服务器 /api/account/save)
-        const bmScript = `javascript:(function(){try{var t='';var p=location.host.indexOf('trae')!==-1?'trae':'codebuddy';for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k);if(v&&(v.indexOf('eyJ')===0||v.indexOf('accessToken')!==-1)){try{var j=JSON.parse(v);t=j.accessToken||j.token||t;}catch(e){if(v.indexOf('eyJ')===0)t=v;}}}for(var i=0;i<sessionStorage.length;i++){var k=sessionStorage.key(i),v=sessionStorage.getItem(k);if(v&&(v.indexOf('eyJ')===0||v.indexOf('accessToken')!==-1)){try{var j=JSON.parse(v);t=j.accessToken||j.token||t;}catch(e){if(v.indexOf('eyJ')===0)t=v;}}}if(!t){var m=document.cookie.match(/(?:accessToken|token|jwt)=([^;]+)/);if(m)t=decodeURIComponent(m[1]);}if(!t){alert('未在当前页面检测到已登录的 Token，请在网页完成登录后重试！');return;}fetch('${hubOrigin}/api/account/save?key=${currentAdminKey}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:p,accessToken:t,remark:'网页一键导入 '+new Date().toLocaleDateString()})}).then(function(r){return r.json();}).then(function(d){if(d.success){alert('🎉 恭喜！当前账号已成功录入【AI 算力与积分智能管家】云端定时签到池！');}else{alert('导入失败: '+(d.error||d.message));}}).catch(function(e){alert('请求失败: '+e);});}catch(err){alert('提取失败: '+err);}})();`;
-
-        const bLink = document.getElementById('bookmarkletLink');
-        if (bLink) {
-          bLink.setAttribute('href', bmScript);
-          bLink.setAttribute('data-script', bmScript);
-        }
+        // 网页控制台 1 键提取并推送代码
+        const snippet = `fetch('${hubOrigin}/api/account/save?key=${currentAdminKey}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:location.host.includes('trae')?'trae':'codebuddy',accessToken:(function(){for(var i=0;i<localStorage.length;i++){var v=localStorage.getItem(localStorage.key(i));if(v&&v.includes('eyJ'))try{return JSON.parse(v).accessToken||v}catch(e){return v}}return (document.cookie.match(/(?:accessToken|token|jwt)=([^;]+)/)||[])[1]||''})(),remark:'网页一键录入 '+new Date().toLocaleDateString()})}).then(r=>r.json()).then(d=>alert(d.success?'🎉 账号已成功录入云端！':'失败: '+(d.error||d.message))).catch(e=>alert('请求错误: '+e));`;
+        const snipEl = document.getElementById('webSnippetText');
+        if (snipEl) snipEl.innerText = snippet;
+        
+        const cmdEl = document.getElementById('localCmdText');
+        if (cmdEl) cmdEl.innerText = `python local_extract.py --server ${hubOrigin} --key ${currentAdminKey}`;
       } catch (e) {
-        console.error('设置书签异常:', e);
+        console.error('初始化工具异常:', e);
       }
     }
 
-    function copyBookmarkletCode() {
-      const bLink = document.getElementById('bookmarkletLink');
-      const script = bLink ? bLink.getAttribute('data-script') : '';
-      if (!script) {
-        alert('正在生成书签脚本，请稍候点击');
-        return;
-      }
-      navigator.clipboard.writeText(script).then(() => {
-        alert('✅ 书签 JS 脚本已成功复制到剪贴板！可直接粘贴至浏览器地址栏或新建书签。');
-      }).catch(err => {
-        prompt('请手动全选复制以下脚本：', script);
+    function copyWebSnippet() {
+      const text = document.getElementById('webSnippetText').innerText;
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        alert('✅ 网页控制台抓取脚本已复制！\n\n使用方法：\n在 CodeBuddy 或 TRAE 官网登录后按 F12 打开控制台（Console），粘贴按回车即可秒级完成录入！');
+      }).catch(() => {
+        prompt('请全选复制以下脚本：', text);
       });
     }
 
+    function downloadSyncBat() {
+      const hubOrigin = window.location.origin;
+      const key = currentAdminKey || 'Hub_98bxy_Sec2026';
+      const content = `@echo off\r\nchcp 65001 >nul\r\ntitle AI-Credits-Hub 本机账号一键同步\r\necho ================================================================\r\necho       🚀 AI 算力与积分智能管家 · 本机账号一键同步\r\necho ================================================================\r\necho.\r\necho 正在自动探测本机 CodeBuddy / WorkBuddy 和 TRAE 客户端凭据...\r\necho.\r\npython -c "import urllib.request, json, os, re, sys, base64, hashlib\ntry:\n    p = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'Tencent-Cloud.coding-copilot.info')\n    if os.path.exists(p):\n        d = json.load(open(p, encoding='utf-8'))\n        t = d.get('auth', {}).get('accessToken')\n        if t:\n            req = urllib.request.Request('${hubOrigin}/api/account/save?key=${key}', data=json.dumps({'platform':'codebuddy', 'accessToken':t, 'remark':'本机 CodeBuddy ('+d.get('account',{}).get('nickname','主号')+')'}).encode('utf-8'), headers={'Content-Type':'application/json'})\n            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n            opener.open(req, timeout=10)\n            print('[OK] 成功同步 CodeBuddy / WorkBuddy 账号')\nexcept Exception as e: print('CodeBuddy:', e)\n\ntry:\n    sp = os.path.join(os.environ.get('APPDATA', ''), 'TRAE SOLO CN', 'User', 'globalStorage', 'storage.json')\n    if not os.path.exists(sp): sp = os.path.join(os.environ.get('APPDATA', ''), 'Trae CN', 'User', 'globalStorage', 'storage.json')\n    if os.path.exists(sp):\n        d = json.load(open(sp, encoding='utf-8'))\n        m = re.search(r'\"token\"\\s*:\\s*\"([^\"]+)\"', open(sp, encoding='utf-8', errors='ignore').read())\n        if m:\n            t = m.group(1)\n            req = urllib.request.Request('${hubOrigin}/api/account/save?key=${key}', data=json.dumps({'platform':'trae', 'accessToken':t, 'remark':'本机 TRAE 客户端'}).encode('utf-8'), headers={'Content-Type':'application/json'})\n            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n            opener.open(req, timeout=10)\n            print('[OK] 成功同步 TRAE 账号')\nexcept Exception as e: print('TRAE:', e)\n"\r\necho.\r\necho ================================================================\r\necho 同步完成！刷新网页控制台即可看到最新账号与算力。\r\necho ================================================================\r\npause\r\n`;
+      const blob = new Blob([content], { type: 'application/x-bat' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ai_sync.bat';
+      a.click();
+    }
+
     function copyLocalCommand() {
-      const cmd = document.getElementById('localCmdText').innerText;
+      const hubOrigin = window.location.origin;
+      const key = currentAdminKey || 'Hub_98bxy_Sec2026';
+      const cmd = `python local_extract.py --server ${hubOrigin} --key ${key}`;
       navigator.clipboard.writeText(cmd).then(() => {
-        alert('✅ 本地同步命令已复制：' + cmd);
+        alert('✅ 本地同步命令已复制：\n' + cmd);
       });
     }
 
@@ -918,11 +952,8 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="text-3xl text-slate-600 mb-2"><i class="fa-regular fa-folder-open"></i></div>
             <p class="text-sm text-slate-400">暂未添加任何 ${platform === 'codebuddy' ? 'CodeBuddy' : 'TRAE'} 账号</p>
             <div class="mt-4 flex items-center justify-center gap-3">
-              <button onclick="openLoginHelperModal('${platform}')" class="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-500/20 transition-all">
-                <i class="fa-solid fa-qrcode mr-1"></i> 扫码 / 快捷登录
-              </button>
-              <button onclick="openAddAccountModal('${platform}')" class="px-4 py-2 glass hover:bg-slate-700/50 text-slate-300 hover:text-white rounded-xl text-xs transition-all">
-                <i class="fa-solid fa-plus mr-1"></i> 手动录入
+              <button onclick="openAddAccountModal('${platform}')" class="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-500/20 transition-all">
+                <i class="fa-solid fa-user-plus mr-1"></i> 添加 / 录入小号
               </button>
             </div>
           </div>
@@ -963,43 +994,33 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="my-3 p-4 rounded-xl bg-slate-900/60 border border-slate-800">
               <div class="text-xs text-slate-400 flex justify-between items-center">
                 <span>当前可用剩余积分 / 算力</span>
-                ${platform === 'codebuddy' ? `<span class="px-2 py-0.5 rounded text-[10px] bg-indigo-500/20 text-indigo-300 font-medium border border-indigo-500/30">${acc.plan_name || '体验版'}</span>` : ''}
+                <span class="px-2 py-0.5 text-[11px] rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">${acc.plan_name || '体验版'}</span>
               </div>
-              <div class="text-2xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-indigo-100 to-indigo-300 mt-1">
-                ${acc.credits} <span class="text-xs font-normal text-slate-400">Points</span>
+              <div class="flex items-baseline gap-2 mt-2">
+                <span class="text-3xl font-extrabold text-white">${acc.credits}</span>
+                <span class="text-sm font-semibold text-slate-400">Points</span>
               </div>
-              ${platform === 'trae' ? `
-                <div class="mt-3">
-                  <div class="flex justify-between text-xs text-slate-400 mb-1">
-                    <span>已消耗 ${acc.consumed || 0}</span>
-                    <span>使用率 ${acc.used_pct || 0}%</span>
-                  </div>
-                  <div class="w-full bg-slate-700 h-1.5 rounded-full overflow-hidden">
-                    <div class="bg-indigo-500 h-1.5 rounded-full" style="width: ${acc.used_pct || 0}%"></div>
-                  </div>
-                </div>
-              ` : `
-                <div class="mt-2 text-[11px] text-slate-400 flex items-center justify-between">
-                  <span>连签 ${acc.streak_days || 0} 天 · 累计签到所得 ${acc.total_earned || acc.credits}</span>
-                  <span class="text-emerald-400/80 text-[10px]">体验版可用</span>
-                </div>
-              `}
+              <div class="mt-2 text-xs text-slate-400 flex items-center justify-between">
+                <span>${acc.status_text}</span>
+                ${platform === 'trae' && acc.consumed !== undefined ? `<span class="text-[11px] text-slate-400">使用率 ${acc.used_pct}%</span>` : '<span class="text-emerald-400 text-[11px]">体验版可用</span>'}
+              </div>
+            </div>
+
+            <div class="flex justify-between items-center text-xs text-slate-400 pt-2 border-t border-slate-800/80">
+              <span>到期: ${acc.expire_time ? acc.expire_time.split(' ')[0] : '-'}</span>
+              <span class="${isSoon ? 'text-amber-400 font-semibold' : 'text-slate-400'}">剩 ${acc.expire_days} 天</span>
             </div>
           </div>
 
-          <div>
-            <div class="py-2 border-t border-slate-700/60 flex items-center justify-between text-xs">
-              <span class="text-slate-400">到期: <span class="text-slate-300">${acc.expire_time.split(' ')[0]}</span></span>
-              <span class="px-2 py-0.5 rounded border text-[11px] ${isSoon ? 'bg-rose-500/20 text-rose-300 border-rose-500/30' : 'bg-slate-700/50 text-slate-300 border-slate-600/30'}">
-                剩 ${acc.expire_days} 天
-              </span>
-            </div>
-
-            <div class="pt-2 border-t border-slate-700/60 flex items-center justify-end gap-2 text-xs">
-              <button onclick="checkinSingle('${platform}', '${acc.id}')" class="px-3 py-1 bg-emerald-600/30 hover:bg-emerald-600 text-emerald-300 hover:text-white rounded-lg transition-all flex items-center gap-1">
-                <i class="fa-solid fa-bolt"></i> 单独签到
+          <div class="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between">
+            <button onclick="triggerCheckinSingle('${platform}', '${acc.id}')" class="px-3 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all">
+              <i class="fa-solid fa-bolt text-emerald-400"></i> 单独签到
+            </button>
+            <div class="flex items-center gap-2">
+              <button onclick="editAccount('${platform}', '${acc.id}')" class="p-1.5 text-slate-400 hover:text-white glass rounded-lg" title="编辑账号">
+                <i class="fa-solid fa-pen-to-square"></i>
               </button>
-              <button onclick="deleteAccount('${platform}', '${acc.id}')" class="px-2.5 py-1 glass hover:bg-rose-900/40 text-slate-400 hover:text-rose-300 rounded-lg transition-all" title="删除账号">
+              <button onclick="deleteAccount('${platform}', '${acc.id}')" class="p-1.5 text-slate-400 hover:text-rose-400 glass rounded-lg" title="删除账号">
                 <i class="fa-solid fa-trash-can"></i>
               </button>
             </div>
@@ -1009,8 +1030,7 @@ HTML_PAGE = """<!DOCTYPE html>
       });
     }
 
-    // 单账号签到
-    async function checkinSingle(platform, id) {
+    async function triggerCheckinSingle(platform, id) {
       try {
         const res = await fetch('/api/account/checkin', {
           method: 'POST',
@@ -1018,23 +1038,22 @@ HTML_PAGE = """<!DOCTYPE html>
           body: JSON.stringify({ platform, id })
         });
         const d = await res.json();
-        alert('签到结果:\\n' + d.message);
-        loadData();
+        alert('签到结果: ' + d.message);
+        loadData(true);
       } catch (e) {
-        alert('请求失败: ' + e);
+        alert('签到请求异常: ' + e);
       }
     }
 
-    // 全平台所有账号签到
     async function triggerCheckinAll() {
       const btn = document.getElementById('checkinAllBtn');
       btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在签到所有账号...';
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在全平台打卡...';
       try {
         const res = await fetch('/api/checkin', { method: 'POST' });
         const d = await res.json();
-        alert('全平台签到执行结果:\\n' + d.message);
-        loadData();
+        alert('全平台签到执行结果:\n' + d.message);
+        loadData(true);
       } catch (e) {
         alert('签到失败: ' + e);
       } finally {
@@ -1046,11 +1065,10 @@ HTML_PAGE = """<!DOCTYPE html>
     // 模态框控制
     function openLoginHelperModal(platform = 'codebuddy') {
       openAddAccountModal(platform);
-      switchModalTab('smart');
     }
 
     function openAddAccountModal(platform = 'codebuddy') {
-      document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与管理 AI 账号';
+      document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-user-plus text-indigo-400"></i> 录入与同步 AI 账号';
       document.getElementById('acc_id').value = '';
       document.getElementById('acc_platform').value = platform;
       document.getElementById('acc_remark').value = '';
@@ -1060,7 +1078,7 @@ HTML_PAGE = """<!DOCTYPE html>
       document.getElementById('acc_trae_uid').value = '';
       document.getElementById('acc_trae_did').value = '766820083601979';
       togglePlatformFields();
-      switchModalTab('smart');
+      switchModalTab('local'); // 默认展示最省心的一键自动同步
       document.getElementById('accountModal').classList.remove('hidden');
     }
 
@@ -1069,10 +1087,11 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function switchModalTab(tab) {
-      const tabs = ['smart', 'manual', 'local'];
+      const tabs = ['local', 'manual', 'web'];
       tabs.forEach(t => {
         const btn = document.getElementById(`tab_btn_${t}`);
         const content = document.getElementById(`tab_content_${t}`);
+        if (!btn || !content) return;
         if (t === tab) {
           btn.className = "px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all flex items-center gap-1.5";
           content.classList.remove('hidden');
@@ -1085,7 +1104,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function handleSmartPaste(val) {
       val = (val || '').trim();
-      if (!val) return;
+      const hintEl = document.getElementById('paste_status_hint');
+      if (!val) {
+        if (hintEl) hintEl.innerText = '💡 提示：支持粘贴 Bearer eyJ... 或包含 token 的任何文本。';
+        return;
+      }
       try {
         // 尝试解析 JSON
         if (val.startsWith('{') && val.endsWith('}')) {
@@ -1098,6 +1121,7 @@ HTML_PAGE = """<!DOCTYPE html>
             togglePlatformFields();
           }
           if (j.uid) document.getElementById('acc_trae_uid').value = j.uid;
+          if (hintEl) hintEl.innerHTML = '<span class="text-emerald-400 font-semibold">✅ 成功解析 JSON 凭据数据</span>';
           return;
         }
       } catch (e) {}
@@ -1105,7 +1129,8 @@ HTML_PAGE = """<!DOCTYPE html>
       // 提取 Bearer Token 或 JWT
       if (val.includes('eyJ')) {
         let token = val;
-        if (token.startsWith('Bearer ')) token = token.slice(7).trim();
+        const m = val.match(/eyJ[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+/);
+        if (m) token = m[0];
         document.getElementById('acc_token').value = token;
         
         // 尝试解码 JWT claims
@@ -1114,18 +1139,21 @@ HTML_PAGE = """<!DOCTYPE html>
           if (parts.length >= 2) {
             const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
             const payload = JSON.parse(decodeURIComponent(escape(atob(b64))));
-            if (payload.preferred_username) {
-              document.getElementById('acc_phone').value = payload.preferred_username;
-            }
-            if (payload.nickname && !document.getElementById('acc_remark').value) {
-              document.getElementById('acc_remark').value = payload.nickname;
+            let phone = payload.preferred_username || '';
+            let nick = payload.nickname || '';
+            if (phone) document.getElementById('acc_phone').value = phone;
+            if (nick && !document.getElementById('acc_remark').value) {
+              document.getElementById('acc_remark').value = nick;
             }
             if (payload.iss && payload.iss.includes('codebuddy')) {
               document.getElementById('acc_platform').value = 'codebuddy';
               togglePlatformFields();
             }
+            if (hintEl) hintEl.innerHTML = `<span class="text-emerald-400 font-semibold">✅ 已成功提取 Token · ${nick ? nick : ''} ${phone ? '('+phone+')' : ''}</span>`;
           }
-        } catch (e) {}
+        } catch (e) {
+          if (hintEl) hintEl.innerHTML = '<span class="text-emerald-400 font-semibold">✅ 已提取 Token 凭据字符串</span>';
+        }
       }
     }
 
@@ -1137,6 +1165,23 @@ HTML_PAGE = """<!DOCTYPE html>
       } else {
         tf.classList.add('hidden');
       }
+    }
+
+    async function editAccount(platform, id) {
+      const list = platform === 'codebuddy' ? globalData.codebuddy_accounts : globalData.trae_accounts;
+      const acc = list.find(a => a.id === id);
+      if (!acc) return;
+      document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-pen-to-square text-indigo-400"></i> 编辑账号凭据';
+      document.getElementById('acc_id').value = acc.id;
+      document.getElementById('acc_platform').value = platform;
+      document.getElementById('acc_remark').value = acc.remark;
+      document.getElementById('acc_phone').value = acc.phone || '';
+      document.getElementById('acc_token').value = '';
+      document.getElementById('acc_trae_uid').value = acc.uid || '';
+      document.getElementById('acc_trae_did').value = acc.deviceId || '766820083601979';
+      togglePlatformFields();
+      switchModalTab('manual');
+      document.getElementById('accountModal').classList.remove('hidden');
     }
 
     async function saveAccount() {
@@ -1171,7 +1216,7 @@ HTML_PAGE = """<!DOCTYPE html>
         if (d.success) {
           alert('🎉 账号验证成功，已保存到云端定时签到池！');
           closeAccountModal();
-          loadData();
+          loadData(true);
         } else {
           alert('保存失败: ' + (d.error || d.message));
         }
@@ -1193,7 +1238,7 @@ HTML_PAGE = """<!DOCTYPE html>
         });
         const d = await res.json();
         if (d.success) {
-          loadData();
+          loadData(true);
         } else {
           alert('删除失败: ' + d.error);
         }
@@ -1239,7 +1284,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const d = await res.json();
         alert(d.message || '系统设置已更新');
         closeSettingsModal();
-        loadData();
+        loadData(true);
       } catch (e) {
         alert('保存失败: ' + e);
       } finally {
@@ -1248,9 +1293,17 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
-    setupBookmarklet();
-    loadData();
-    setInterval(loadData, 20000);
+    setupWebTools();
+    // 每次进入或刷新页面，强制向平台查最新数据
+    loadData(true);
+    setInterval(() => loadData(false), 20000);
+
+    // 当用户切回网页标签页时，自动重新查询最新算力
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        loadData(true);
+      }
+    });
   </script>
 </body>
 </html>
@@ -1340,7 +1393,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_PAGE.encode("utf-8"))
 
         elif p == "/api/data":
-            if not DATA_CACHE.get("summary"):
+            force_refresh = query.get("refresh", [""])[0] in ("1", "true")
+            cache_expired = (time.time() - CACHE_LAST_FETCH) > 5
+            if force_refresh or cache_expired or not DATA_CACHE.get("summary"):
                 update_cache()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")

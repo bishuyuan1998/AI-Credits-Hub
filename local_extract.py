@@ -173,7 +173,12 @@ def extract_all():
 def push_to_remote(server_url, key, platform, acc_data):
     try:
         import urllib.request
-        url = server_url.rstrip("/") + "/api/account/save"
+        # 禁用系统代理，直连服务器，避免受到本地科学上网/VPN 拦截导致 503
+        no_proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(no_proxy_handler)
+        
+        sep = "&" if "?" in server_url else "?"
+        url = server_url.rstrip("/") + f"/api/account/save{sep}key={key}"
         payload = {
             "platform": platform,
             "remark": acc_data.get("remark") or acc_data.get("nickname") or "本机自动提取账号",
@@ -188,19 +193,27 @@ def push_to_remote(server_url, key, platform, acc_data):
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Hub-Sync/1.0",
                 "X-Hub-Key": key
             }
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             res = json.loads(resp.read().decode("utf-8"))
             if res.get("success"):
-                print(f"  ☁️ 远程同步成功 [{platform}]: {res.get('id')}")
+                print(f"  ☁️ 远程同步成功 [{platform}]: {res.get('message', '账号已同步')}")
             else:
                 print(f"  ⚠️ 远程同步失败 [{platform}]: {res.get('error')}")
     except Exception as e:
-        print(f"  ❌ 远程推送失败: {e}")
+        print(f"  ❌ 远程推送失败 [{platform}]: {e}")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="AI-Credits-Hub 本机凭据提取与同步")
+    parser.add_argument("--server", help="远程 Hub 服务器地址，例如 http://47.77.190.116:9527")
+    parser.add_argument("--key", help="远程 Hub 密钥", default="Hub_98bxy_Sec2026")
+    parser.add_argument("--push", action="store_true", help="是否直接推送到云端")
+    args = parser.parse_args()
+
     print("=" * 64)
     print("       🚀 本地 AI 客户端凭据一键提取与多账号同步工具")
     print("=" * 64)
@@ -210,7 +223,7 @@ def main():
     out_file = os.path.join(script_dir, "config.json")
 
     # 读取已有配置
-    cfg = {"auth": {"admin_key": "888888"}, "codebuddy_accounts": [], "trae_accounts": []}
+    cfg = {"auth": {"admin_key": "Hub_98bxy_Sec2026"}, "codebuddy_accounts": [], "trae_accounts": []}
     if os.path.exists(out_file):
         try:
             with open(out_file, "r", encoding="utf-8") as f:
@@ -263,21 +276,25 @@ def main():
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-    print(f"\n🎉 凭证已成功保存至本地多账号配置文件: {out_file}")
+    print(f"\n🎉 凭证已成功保存至本地配置文件: {out_file}")
 
-    # 询问是否推送到云服务器
-    try:
-        remote = input("\n👉 是否推送到远程云服务器？(直接按回车跳过，或输入服务器地址如 http://47.77.190.116:9527): ").strip()
-        if remote:
-            key = input("👉 请输入远程管理密钥 (默认 888888): ").strip() or "888888"
-            print("正在同步到云端...")
-            if data.get("codebuddy", {}).get("accessToken"):
-                push_to_remote(remote, key, "codebuddy", data["codebuddy"])
-            if data.get("trae", {}).get("accessToken"):
-                push_to_remote(remote, key, "trae", data["trae"])
-            print("✅ 远程多账号同步完成！")
-    except (KeyboardInterrupt, EOFError):
-        pass
+    remote = args.server
+    key = args.key
+    if not remote and not args.push:
+        try:
+            remote = input("\n👉 是否推送到远程云服务器？(直接回车跳过，或输入如 http://47.77.190.116:9527): ").strip()
+            if remote:
+                key = input("👉 请输入远程管理密钥 (默认 Hub_98bxy_Sec2026): ").strip() or "Hub_98bxy_Sec2026"
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+    if remote:
+        print(f"\n正在同步到云端服务器: {remote} ...")
+        if data.get("codebuddy", {}).get("accessToken"):
+            push_to_remote(remote, key, "codebuddy", data["codebuddy"])
+        if data.get("trae", {}).get("accessToken"):
+            push_to_remote(remote, key, "trae", data["trae"])
+        print("✅ 远程多账号同步完成！")
 
     print("=" * 64)
 
