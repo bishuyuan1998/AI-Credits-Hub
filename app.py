@@ -915,7 +915,7 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const res = await apiFetch('/api/config');
         const cfg = await res.json();
-        currentAdminKey = cfg.auth?.admin_key || 'Hub_98bxy_Sec2026';
+        currentAdminKey = cfg.auth?.admin_key || currentAdminKey || 'Hub_98bxy_Sec2026';
         const hubOrigin = window.location.origin;
 
         // 网页控制台 1 键提取并推送代码
@@ -934,21 +934,15 @@ HTML_PAGE = """<!DOCTYPE html>
       const text = document.getElementById('webSnippetText').innerText;
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => {
-        alert('✅ 网页控制台抓取脚本已复制！\n\n使用方法：\n在 CodeBuddy 或 TRAE 官网登录后按 F12 打开控制台（Console），粘贴按回车即可秒级完成录入！');
+        alert('✅ 网页控制台抓取脚本已复制！可直接在 CodeBuddy 或 TRAE 官网按 F12 控制台粘贴回车！');
       }).catch(() => {
         prompt('请全选复制以下脚本：', text);
       });
     }
 
     function downloadSyncBat() {
-      const hubOrigin = window.location.origin;
-      const key = currentAdminKey || 'Hub_98bxy_Sec2026';
-      const content = `@echo off\r\nchcp 65001 >nul\r\ntitle AI-Credits-Hub 本机账号一键同步\r\necho ================================================================\r\necho       🚀 AI 算力与积分智能管家 · 本机账号一键同步\r\necho ================================================================\r\necho.\r\necho 正在自动探测本机 CodeBuddy / WorkBuddy 和 TRAE 客户端凭据...\r\necho.\r\npython -c "import urllib.request, json, os, re, sys, base64, hashlib\ntry:\n    p = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'Tencent-Cloud.coding-copilot.info')\n    if os.path.exists(p):\n        d = json.load(open(p, encoding='utf-8'))\n        t = d.get('auth', {}).get('accessToken')\n        if t:\n            req = urllib.request.Request('${hubOrigin}/api/account/save?key=${key}', data=json.dumps({'platform':'codebuddy', 'accessToken':t, 'remark':'本机 CodeBuddy ('+d.get('account',{}).get('nickname','主号')+')'}).encode('utf-8'), headers={'Content-Type':'application/json'})\n            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n            opener.open(req, timeout=10)\n            print('[OK] 成功同步 CodeBuddy / WorkBuddy 账号')\nexcept Exception as e: print('CodeBuddy:', e)\n\ntry:\n    sp = os.path.join(os.environ.get('APPDATA', ''), 'TRAE SOLO CN', 'User', 'globalStorage', 'storage.json')\n    if not os.path.exists(sp): sp = os.path.join(os.environ.get('APPDATA', ''), 'Trae CN', 'User', 'globalStorage', 'storage.json')\n    if os.path.exists(sp):\n        d = json.load(open(sp, encoding='utf-8'))\n        m = re.search(r'\"token\"\\s*:\\s*\"([^\"]+)\"', open(sp, encoding='utf-8', errors='ignore').read())\n        if m:\n            t = m.group(1)\n            req = urllib.request.Request('${hubOrigin}/api/account/save?key=${key}', data=json.dumps({'platform':'trae', 'accessToken':t, 'remark':'本机 TRAE 客户端'}).encode('utf-8'), headers={'Content-Type':'application/json'})\n            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n            opener.open(req, timeout=10)\n            print('[OK] 成功同步 TRAE 账号')\nexcept Exception as e: print('TRAE:', e)\n"\r\necho.\r\necho ================================================================\r\necho 同步完成！刷新网页控制台即可看到最新账号与算力。\r\necho ================================================================\r\npause\r\n`;
-      const blob = new Blob([content], { type: 'application/x-bat' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'ai_sync.bat';
-      a.click();
+      const k = currentAdminKey || localStorage.getItem('ai_hub_key') || 'Hub_98bxy_Sec2026';
+      window.location.href = `/api/download/sync-bat?key=${encodeURIComponent(k)}`;
     }
 
     function copyLocalCommand() {
@@ -956,7 +950,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const key = currentAdminKey || 'Hub_98bxy_Sec2026';
       const cmd = `python local_extract.py --server ${hubOrigin} --key ${key}`;
       navigator.clipboard.writeText(cmd).then(() => {
-        alert('✅ 本地同步命令已复制：\n' + cmd);
+        alert('✅ 本地同步命令已复制：' + cmd);
       });
     }
 
@@ -1068,7 +1062,7 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const res = await apiFetch('/api/checkin', { method: 'POST' });
         const d = await res.json();
-        alert('全平台签到执行结果:\n' + d.message);
+        alert('全平台签到执行结果:\\n' + d.message);
         loadData(true);
       } catch (e) {
         alert('签到失败: ' + e);
