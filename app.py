@@ -1525,9 +1525,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not account_data["phone"] and test_res.get("phone"):
                     account_data["phone"] = test_res.get("phone")
 
-            # 更新或添加
-            existing_idx = next((i for i, a in enumerate(cfg[key_name]) if a.get("id") == acc_id), -1)
+            # 智能防重：根据 id 或平台的唯一 uid 匹配已有账号进行就地更新
+            target_uid = account_data.get("uid")
+            existing_idx = next(
+                (i for i, a in enumerate(cfg[key_name]) if (acc_id and a.get("id") == acc_id) or (target_uid and str(a.get("uid")) == str(target_uid))),
+                -1
+            )
             if existing_idx >= 0:
+                old_acc = cfg[key_name][existing_idx]
+                account_data["id"] = old_acc.get("id", acc_id)
+                if old_acc.get("remark") and (body.get("remark") in ("账号", "本机自动提取账号", "") or not body.get("remark")):
+                    account_data["remark"] = old_acc.get("remark")
                 cfg[key_name][existing_idx] = account_data
             else:
                 cfg[key_name].append(account_data)
