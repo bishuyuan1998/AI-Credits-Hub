@@ -852,15 +852,27 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <script>
+    window.__ADMIN_KEY__ = "{{ADMIN_KEY}}";
     let globalData = null;
-    let currentAdminKey = '';
+    let currentAdminKey = window.__ADMIN_KEY__ || new URLSearchParams(window.location.search).get('key') || localStorage.getItem('ai_hub_key') || '';
+    if (currentAdminKey) localStorage.setItem('ai_hub_key', currentAdminKey);
+
+    // 统一 API 请求封装：自动携带安全密钥（无论 Cookie 是否被浏览器阻断，均 100% 鉴权成功）
+    function apiFetch(url, options = {}) {
+      const k = currentAdminKey || localStorage.getItem('ai_hub_key') || '';
+      const sep = url.includes('?') ? '&' : '?';
+      const fullUrl = k ? `${url}${sep}key=${encodeURIComponent(k)}` : url;
+      options.headers = options.headers || {};
+      if (k) options.headers['X-Hub-Key'] = k;
+      return fetch(fullUrl, options);
+    }
 
     async function loadData(force = false) {
       const icon = document.getElementById('refreshIcon');
       if (icon) icon.classList.add('fa-spin');
       try {
         const url = force ? '/api/data?refresh=1' : '/api/data';
-        const res = await fetch(url);
+        const res = await apiFetch(url);
         if (res.status === 403) {
           location.reload();
           return;
@@ -888,7 +900,11 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById('trae_count_badge').innerText = `${globalData.trae_accounts.length} 个账号`;
 
       } catch (err) {
-        console.error(err);
+        console.error('loadData error:', err);
+        const refreshEl = document.getElementById('stat_refresh_time');
+        if (refreshEl) {
+          refreshEl.innerHTML = `<span class="text-rose-400 cursor-pointer" onclick="loadData(true)"><i class="fa-solid fa-triangle-exclamation"></i> 刷新失败，点击重试</span>`;
+        }
       } finally {
         if (icon) icon.classList.remove('fa-spin');
       }
@@ -897,7 +913,7 @@ HTML_PAGE = """<!DOCTYPE html>
     // 初始化提取工具与命令
     async function setupWebTools() {
       try {
-        const res = await fetch('/api/config');
+        const res = await apiFetch('/api/config');
         const cfg = await res.json();
         currentAdminKey = cfg.auth?.admin_key || 'Hub_98bxy_Sec2026';
         const hubOrigin = window.location.origin;
@@ -1032,7 +1048,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     async function triggerCheckinSingle(platform, id) {
       try {
-        const res = await fetch('/api/account/checkin', {
+        const res = await apiFetch('/api/account/checkin', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ platform, id })
@@ -1050,7 +1066,7 @@ HTML_PAGE = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在全平台打卡...';
       try {
-        const res = await fetch('/api/checkin', { method: 'POST' });
+        const res = await apiFetch('/api/checkin', { method: 'POST' });
         const d = await res.json();
         alert('全平台签到执行结果:\n' + d.message);
         loadData(true);
@@ -1207,7 +1223,7 @@ HTML_PAGE = """<!DOCTYPE html>
       }
 
       try {
-        const res = await fetch('/api/account/save', {
+        const res = await apiFetch('/api/account/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -1231,7 +1247,7 @@ HTML_PAGE = """<!DOCTYPE html>
     async function deleteAccount(platform, id) {
       if (!confirm('确定要删除该账号吗？')) return;
       try {
-        const res = await fetch('/api/account/delete', {
+        const res = await apiFetch('/api/account/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ platform, id })
@@ -1250,7 +1266,7 @@ HTML_PAGE = """<!DOCTYPE html>
     // 系统设置
     async function openSettingsModal() {
       try {
-        const res = await fetch('/api/config');
+        const res = await apiFetch('/api/config');
         const cfg = await res.json();
         document.getElementById('cfg_admin_key').value = cfg.auth?.admin_key || '';
         document.getElementById('cfg_sched_hour').value = cfg.settings?.auto_checkin_hour ?? 9;
@@ -1276,7 +1292,7 @@ HTML_PAGE = """<!DOCTYPE html>
       };
 
       try {
-        const res = await fetch('/api/config/save', {
+        const res = await apiFetch('/api/config/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -1390,7 +1406,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 种植 30 天 Cookie 免密
                 self.send_header("Set-Cookie", f"ai_hub_key={admin_key}; Path=/; Max-Age=2592000; SameSite=Lax")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            rendered_page = HTML_PAGE.replace("{{ADMIN_KEY}}", admin_key)
+            self.wfile.write(rendered_page.encode("utf-8"))
 
         elif p == "/api/data":
             force_refresh = query.get("refresh", [""])[0] in ("1", "true")
