@@ -8,7 +8,7 @@ cron.log
 checkin.log
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 
 # è¿è¡Œæ—¶æ•°æ®
 *.db
@@ -20,5 +20,7 @@ Thumbs.db
 .vscode/
 .idea/
 
-# ºöÂÔ±¾µØÁÙÊ±Åú´¦Àí
+# æœ¬åœ°ä¸´æ—¶è„šæœ¬ä¸è®°å½•
 *.bat
+*.vbs
+è¿›åº¦è®°å½•.md

@@ -1,31 +1,42 @@
 {
   "auth": {
-    "admin_key": "888888",
-    "admin_password": ""
+    "admin_key": "YourSecretKey2026"
   },
   "settings": {
-    "auto_checkin_hour": 9,
-    "auto_checkin_minute": 0
+    "auto_checkin_hour": 10,
+    "auto_checkin_minute": 5
   },
   "codebuddy_accounts": [
     {
-      "id": "cb_demo_01",
-      "remark": "CodeBuddy 主账号",
-      "accessToken": "YOUR_CODEBUDDY_ACCESS_TOKEN",
+      "id": "cb_demo_1",
+      "remark": "CodeBuddy 示例主号",
+      "accessToken": "eyJhbGciOi...",
       "refreshToken": "",
-      "nickname": "示例主号",
-      "uid": "",
+      "uid": "cb-demo-uid-01",
+      "phone": "13800000000",
       "enabled": true
     }
   ],
   "trae_accounts": [
     {
-      "id": "trae_demo_01",
-      "remark": "TRAE 主账号",
-      "accessToken": "YOUR_TRAE_ACCESS_TOKEN",
+      "id": "trae_demo_1",
+      "remark": "TRAE 示例主号",
+      "accessToken": "eyJhbGciOi...",
       "refreshToken": "",
       "uid": "2990000000000000",
       "deviceId": "766820083601979",
+      "enabled": true
+    }
+  ],
+  "qoder_accounts": [
+    {
+      "id": "qoder_demo_1",
+      "remark": "Qoder 每日 100 Credits 示例账号",
+      "token": "dt-demo-token",
+      "refreshToken": "drt-demo-refresh-token",
+      "uid": "qoder-demo-uid-01",
+      "name": "QoderUser",
+      "phone": "13900000000",
       "enabled": true
     }
   ]

@@ -84,6 +84,68 @@ def format_phone(p):
         return f"{p[:3]}****{p[-4:]}"
     return p
 
+
+def deduplicate_accounts(cfg):
+    """全局自动去重：按照 uid / token 合并同账号，防止重复卡片，保留用户自定义备注"""
+    changed = False
+
+    for key_name in ["codebuddy_accounts", "trae_accounts", "qoder_accounts"]:
+        accounts = cfg.get(key_name, [])
+        if not accounts:
+            continue
+
+        unique_map = {}
+        cleaned_list = []
+
+        for acc in accounts:
+            uid = str(acc.get("uid") or "").strip()
+            token = (acc.get("token") or acc.get("accessToken") or "").strip()
+            # 唯一标识优先用 uid，其次用 token 签名
+            ident = uid if uid else (token[:32] if token else acc.get("id"))
+
+            if not ident:
+                cleaned_list.append(acc)
+                continue
+
+            if ident not in unique_map:
+                unique_map[ident] = acc
+                cleaned_list.append(acc)
+            else:
+                existing = unique_map[ident]
+                changed = True
+                
+                # 保留非泛型自定义备注
+                cur_remark = existing.get("remark", "")
+                new_remark = acc.get("remark", "")
+                is_cur_generic = not cur_remark or "UID:" in cur_remark or cur_remark.startswith("主账号") or cur_remark in ("我的账号", "用户")
+                is_new_generic = not new_remark or "UID:" in new_remark or new_remark.startswith("主账号") or new_remark in ("我的账号", "用户")
+                
+                if is_cur_generic and not is_new_generic:
+                    existing["remark"] = new_remark
+                    existing["is_custom_remark"] = True
+                elif acc.get("is_custom_remark") and not existing.get("is_custom_remark"):
+                    existing["remark"] = new_remark
+                    existing["is_custom_remark"] = True
+
+                # 合并属性
+                for k in ["phone", "accessToken", "token", "refreshToken", "deviceId", "name", "nickname"]:
+                    if not existing.get(k) and acc.get(k):
+                        existing[k] = acc[k]
+
+        if changed or len(cleaned_list) != len(accounts):
+            cfg[key_name] = cleaned_list
+            changed = True
+
+    # 移除可能遗留的旧版单账号字典
+    if "trae" in cfg and isinstance(cfg["trae"], dict):
+        del cfg["trae"]
+        changed = True
+    if "codebuddy" in cfg and isinstance(cfg["codebuddy"], dict):
+        del cfg["codebuddy"]
+        changed = True
+
+    return changed
+
 def load_config():
     """读取配置并自动将旧的单账号格式平滑迁移为多账号列表"""
     cfg = {}
@@ -137,6 +199,8 @@ def load_config():
     # 平滑迁移旧 TRAE 账号 -> 账号列表
     if "trae_accounts" not in cfg:
         cfg["trae_accounts"] = []
+    if "qoder_accounts" not in cfg:
+        cfg["qoder_accounts"] = []
         old_trae = cfg.get("trae")
         if old_trae and isinstance(old_trae, dict) and old_trae.get("accessToken"):
             cfg["trae_accounts"].append({
@@ -151,6 +215,9 @@ def load_config():
             })
             changed = True
 
+    if deduplicate_accounts(cfg):
+        changed = True
+
     if changed and os.path.exists(CONFIG_FILE):
         try:
             save_config(cfg)
@@ -160,6 +227,7 @@ def load_config():
     return cfg
 
 def save_config(cfg):
+    deduplicate_accounts(cfg)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -380,6 +448,133 @@ def checkin_trae_account(acc):
     except Exception as e:
         return f"网络异常: {e}"
 
+
+def fetch_single_qoder(acc):
+    token = (acc.get("token") or acc.get("accessToken") or "").strip()
+    phone = acc.get("phone") or ""
+    res = {
+        "id": acc.get("id"),
+        "remark": acc.get("remark") or "我的 Qoder 账号",
+        "phone": phone,
+        "masked_phone": format_phone(phone) if phone else (acc.get("name") or "Qoder用户"),
+        "name": acc.get("name") or "Qoder用户",
+        "uid": acc.get("uid") or "未配置",
+        "enabled": acc.get("enabled", True),
+        "active": bool(token),
+        "today_checked": False,
+        "credits": 0,
+        "total_credits": 1000,
+        "consumed": 0,
+        "used_pct": 0,
+        "plan_name": "Free 体验版",
+        "expire_time": "30天滚动有效",
+        "expire_days": 30,
+        "status_text": "未配置 Token",
+        "valid": False,
+        "campaign_id": ""
+    }
+    if not token:
+        return res
+
+    s = get_session()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Cosy-ClientType": "10",
+        "Cosy-Version": "0.4.8",
+        "User-Agent": "Qoder"
+    }
+
+    # 1. 查询活动与今日签到状态 (每天领 100 Credits)
+    try:
+        r_camp = s.get("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", headers=headers, timeout=8)
+        if r_camp.status_code == 200:
+            cdata = r_camp.json()
+            for c in cdata.get("campaigns", []):
+                if c.get("actionType") == "CLAIM_BENEFIT" and c.get("benefit", {}).get("kind") == "CREDITS":
+                    res["campaign_id"] = c.get("campaignId", "")
+                    res["today_checked"] = (c.get("claimStatus") == "CLAIMED")
+                    break
+    except Exception:
+        pass
+
+    # 2. 查询用量与额度 (Usage)
+    try:
+        r_usg = s.get("https://openapi.qoder.com.cn/sash/api/v2/me/usage", headers=headers, timeout=8)
+        if r_usg.status_code == 200:
+            res["valid"] = True
+            udata = r_usg.json()
+            qu = udata.get("qoderUsage", {})
+            user_q = qu.get("userQuota", {})
+            addon_q = qu.get("addOnQuota", {})
+            
+            tot = user_q.get("total", 0) + addon_q.get("total", 0)
+            rem = user_q.get("remaining", 0) + addon_q.get("remaining", 0)
+            used = user_q.get("used", 0) + addon_q.get("used", 0)
+            
+            res["total_credits"] = tot if tot > 0 else 1000
+            res["credits"] = rem
+            res["consumed"] = used
+            res["used_pct"] = round((used / tot * 100), 1) if tot > 0 else 0
+            
+            exp_ts = qu.get("expiresAt")
+            if exp_ts and exp_ts < 253402214400000:
+                exp = datetime.datetime.fromtimestamp(exp_ts / 1000 if exp_ts > 1e11 else exp_ts)
+                res["expire_time"] = exp.strftime("%Y-%m-%d %H:%M:%S")
+                res["expire_days"] = max(0, (exp - datetime.datetime.now()).days)
+            else:
+                res["expire_time"] = "30天滚动有效"
+                res["expire_days"] = 30
+                
+            res["status_text"] = "今日已领 100 Credits" if res["today_checked"] else "待领取 100 Credits"
+        elif r_usg.status_code == 401:
+            res["status_text"] = "Token 已失效 (401)"
+        else:
+            res["status_text"] = f"响应异常 ({r_usg.status_code})"
+    except Exception as e:
+        res["status_text"] = f"请求错误: {str(e)[:25]}"
+
+    return res
+
+def checkin_qoder_account(acc):
+    token = (acc.get("token") or acc.get("accessToken") or "").strip()
+    if not token or not acc.get("enabled", True):
+        return "未启用或无 Token"
+    s = get_session()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Cosy-ClientType": "10",
+        "Cosy-Version": "0.4.8",
+        "User-Agent": "Qoder"
+    }
+    try:
+        campaign_id = acc.get("campaign_id")
+        if not campaign_id:
+            r_c = s.get("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", headers=headers, timeout=8)
+            if r_c.status_code == 200:
+                for c in r_c.json().get("campaigns", []):
+                    if c.get("actionType") == "CLAIM_BENEFIT" and c.get("benefit", {}).get("kind") == "CREDITS":
+                        campaign_id = c.get("campaignId")
+                        if c.get("claimStatus") == "CLAIMED":
+                            return "今日已领 100 Credits (无需重复领取)"
+                        break
+
+        if not campaign_id:
+            return "未找到当前可领取的 100 Credits 活动"
+
+        r_claim = s.post(f"https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/{campaign_id}/claim", headers=headers, json={}, timeout=8)
+        if r_claim.status_code == 200:
+            cres = r_claim.json()
+            if cres.get("replayed"):
+                return "今日已领 100 Credits (今日已领过)"
+            return "🎉 成功领取今日 100 Credits 算力！"
+        return f"HTTP {r_claim.status_code}: {r_claim.text[:50]}"
+    except Exception as e:
+        return f"网络异常: {e}"
+
 def execute_all_checkin():
     cfg = load_config()
     results = []
@@ -413,18 +608,21 @@ def update_cache():
     cfg = load_config()
     cb_accounts = cfg.get("codebuddy_accounts", [])
     trae_accounts = cfg.get("trae_accounts", [])
+    qoder_accounts = cfg.get("qoder_accounts", [])
 
-    # 使用多线程高并发并行查询所有账号，耗时由原来的累加变为并发 0.3s
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # 使用多线程高并发并行查询所有账号
+    with ThreadPoolExecutor(max_workers=15) as executor:
         cb_futures = [executor.submit(fetch_single_codebuddy, a) for a in cb_accounts]
         trae_futures = [executor.submit(fetch_single_trae, a) for a in trae_accounts]
+        qoder_futures = [executor.submit(fetch_single_qoder, a) for a in qoder_accounts]
         cb_res = [f.result() for f in cb_futures]
         trae_res = [f.result() for f in trae_futures]
+        qoder_res = [f.result() for f in qoder_futures]
 
-    total_acc = len(cb_res) + len(trae_res)
-    checked_count = sum(1 for a in cb_res + trae_res if a.get("today_checked"))
-    # 计算当前可用剩余总算力
-    total_credits = round(sum(float(a.get("credits", 0)) for a in cb_res + trae_res), 1)
+    all_res = cb_res + trae_res + qoder_res
+    total_acc = len(all_res)
+    checked_count = sum(1 for a in all_res if a.get("today_checked"))
+    total_credits = round(sum(float(a.get("credits", 0)) for a in all_res), 1)
 
     DATA_CACHE = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -432,10 +630,14 @@ def update_cache():
             "total_accounts": total_acc,
             "today_checked_count": checked_count,
             "total_credits": total_credits,
-            "scheduler_time": f"{cfg.get('settings', {}).get('auto_checkin_hour', 9):02d}:{cfg.get('settings', {}).get('auto_checkin_minute', 0):02d}"
+            "codebuddy_count": len(cb_res),
+            "trae_count": len(trae_res),
+            "qoder_count": len(qoder_res),
+            "scheduler_time": f"{cfg.get('settings', {}).get('auto_checkin_hour', 10):02d}:{cfg.get('settings', {}).get('auto_checkin_minute', 5):02d}"
         },
         "codebuddy_accounts": cb_res,
-        "trae_accounts": trae_res
+        "trae_accounts": trae_res,
+        "qoder_accounts": qoder_res
     }
     CACHE_LAST_FETCH = time.time()
     return DATA_CACHE
@@ -568,6 +770,26 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
       <div id="traeGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+    </section>
+
+    <!-- Qoder 账号矩阵 -->
+    <section class="space-y-4 mb-8">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <span class="p-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-base"><i class="fa-solid fa-cube"></i></span>
+          <h2 class="text-lg font-bold text-slate-200">通义 / 阿里 Qoder (每天 100 Credits) 账号池</h2>
+          <span id="qoder_count_badge" class="px-2 py-0.5 text-xs bg-slate-800 text-slate-400 rounded-md border border-slate-700">0 个账号</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <button onclick="openLoginHelperModal('qoder')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+            <i class="fa-solid fa-wand-magic-sparkles"></i> 快捷同步指南
+          </button>
+          <button onclick="openAddAccountModal('qoder')" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+            <i class="fa-solid fa-plus"></i> 手动录入
+          </button>
+        </div>
+      </div>
+      <div id="qoderGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
     </section>
 
     <!-- 优惠情报与备用切换 -->
@@ -733,6 +955,7 @@ HTML_PAGE = """<!DOCTYPE html>
             <select id="acc_platform" onchange="togglePlatformFields()" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-slate-200 focus:outline-none focus:border-indigo-500">
               <option value="codebuddy">腾讯 CodeBuddy / WorkBuddy</option>
               <option value="trae">字节跳动 TRAE CN (SOLO)</option>
+              <option value="qoder">通义 / 阿里 Qoder (每天 100 Credits)</option>
             </select>
           </div>
 
@@ -943,6 +1166,13 @@ HTML_PAGE = """<!DOCTYPE html>
         renderAccounts('trae', globalData.trae_accounts, document.getElementById('traeGrid'));
         document.getElementById('trae_count_badge').innerText = `${globalData.trae_accounts.length} 个账号`;
 
+        // 渲染 Qoder
+        if (globalData.qoder_accounts) {
+          renderAccounts('qoder', globalData.qoder_accounts, document.getElementById('qoderGrid'));
+          const qb = document.getElementById('qoder_count_badge');
+          if (qb) qb.innerText = `${globalData.qoder_accounts.length} 个账号`;
+        }
+
       } catch (err) {
         console.error('loadData error:', err);
         const refreshEl = document.getElementById('stat_refresh_time');
@@ -1004,7 +1234,7 @@ HTML_PAGE = """<!DOCTYPE html>
         container.innerHTML = `
           <div class="col-span-full glass-card p-8 rounded-2xl text-center border-dashed border-2 border-slate-700/60">
             <div class="text-3xl text-slate-600 mb-2"><i class="fa-regular fa-folder-open"></i></div>
-            <p class="text-sm text-slate-400">暂未添加任何 ${platform === 'codebuddy' ? 'CodeBuddy' : 'TRAE'} 账号</p>
+            <p class="text-sm text-slate-400">暂未添加任何 ${platform === 'codebuddy' ? 'CodeBuddy' : (platform === 'trae' ? 'TRAE' : 'Qoder')} 账号</p>
             <div class="mt-4 flex items-center justify-center gap-3">
               <button onclick="openAddAccountModal('${platform}')" class="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-500/20 transition-all">
                 <i class="fa-solid fa-user-plus mr-1"></i> 添加 / 录入小号
@@ -1017,9 +1247,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
       accounts.forEach(acc => {
         const isSoon = acc.expire_days <= 7;
+        const checkedLabel = platform === 'qoder' ? '今日已领 100' : '今日已签';
+        const pendingLabel = platform === 'qoder' ? '待领 100 算力' : '待签到';
         const badge = acc.today_checked 
-          ? '<span class="px-2.5 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full text-xs font-medium"><i class="fa-solid fa-check"></i> 今日已签</span>'
-          : (acc.valid ? '<span class="px-2.5 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-xs font-medium"><i class="fa-solid fa-clock"></i> 待签到</span>' : '<span class="px-2.5 py-1 bg-rose-500/20 text-rose-300 border border-rose-500/30 rounded-full text-xs font-medium">凭据失效</span>');
+          ? `<span class="px-2.5 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full text-xs font-medium"><i class="fa-solid fa-check"></i> ${checkedLabel}</span>`
+          : (acc.valid ? `<span class="px-2.5 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-xs font-medium"><i class="fa-solid fa-gift"></i> ${pendingLabel}</span>` : '<span class="px-2.5 py-1 bg-rose-500/20 text-rose-300 border border-rose-500/30 rounded-full text-xs font-medium">凭据失效</span>');
 
         const card = document.createElement('div');
         card.className = "glass p-5 rounded-2xl shadow-lg glow transition-all duration-300 flex flex-col justify-between";
@@ -1057,7 +1289,7 @@ HTML_PAGE = """<!DOCTYPE html>
               </div>
               <div class="flex items-baseline gap-2 mt-2">
                 <span class="text-3xl font-extrabold text-white">${acc.credits}</span>
-                <span class="text-sm font-semibold text-slate-400">Points</span>
+                <span class="text-sm font-semibold text-slate-400">${platform === 'qoder' ? 'Credits' : 'Points'}</span>
               </div>
               <div class="mt-2 text-xs text-slate-400 flex items-center justify-between">
                 <span>${acc.status_text}</span>
@@ -1231,7 +1463,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         // 快速备注修改逻辑
     function openRemarkModal(platform, id) {
-      const list = platform === 'codebuddy' ? globalData?.codebuddy_accounts : globalData?.trae_accounts;
+      const list = platform === 'codebuddy' ? globalData?.codebuddy_accounts : (platform === 'trae' ? globalData?.trae_accounts : globalData?.qoder_accounts);
       const acc = (list || []).find(a => a.id === id);
       if (!acc) return;
       document.getElementById('remark_platform').value = platform;
@@ -1239,7 +1471,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const input = document.getElementById('remark_input');
       input.value = acc.remark || '';
       
-      const platName = platform === 'trae' ? '字节跳动 TRAE CN' : '腾讯 CodeBuddy / WorkBuddy';
+      const platName = platform === 'trae' ? '字节跳动 TRAE CN' : (platform === 'codebuddy' ? '腾讯 CodeBuddy / WorkBuddy' : '通义 / 阿里 Qoder');
       const uidText = acc.uid ? ` (UID: ${acc.uid})` : '';
       document.getElementById('remarkModalSubtitle').innerText = `${platName}${uidText}`;
 
@@ -1533,67 +1765,48 @@ class Handler(BaseHTTPRequestHandler):
             rendered_page = HTML_PAGE.replace("{{ADMIN_KEY}}", admin_key)
             self.wfile.write(rendered_page.encode("utf-8"))
 
+        elif p == "/api/download/local-extract":
+            le_path = os.path.join(SCRIPT_DIR, "local_extract.py")
+            if os.path.exists(le_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-python; charset=utf-8")
+                self.send_header("Content-Disposition", "attachment; filename=local_extract.py")
+                self.end_headers()
+                with open(le_path, "rb") as fp:
+                    self.wfile.write(fp.read())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         elif p == "/api/download/sync-bat":
             host = self.headers.get("Host", f"47.77.190.116:{PORT}")
-            bat_code = f"""@echo off
-chcp 65001 >nul
-title AI-Credits-Hub 本机账号一键同步
-echo ================================================================
-echo       AI 算力与积分智能管家 · 本机账号一键同步
-echo ================================================================
-echo.
-echo 正在自动探测本机 CodeBuddy / WorkBuddy 和 TRAE 客户端凭据...
-echo.
-
-python -c "
-import urllib.request, json, os, re, sys
-
-# 1. 探测 CodeBuddy
-try:
-    p = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'Tencent-Cloud.coding-copilot.info')
-    if os.path.exists(p):
-        d = json.load(open(p, encoding='utf-8'))
-        t = d.get('auth', {{}}).get('accessToken')
-        if t:
-            req = urllib.request.Request('http://{host}/api/account/save?key={admin_key}', data=json.dumps({{'platform':'codebuddy', 'accessToken':t, 'remark':'本机 CodeBuddy ('+d.get('account',{{}}).get('nickname','主号')+')'}}).encode('utf-8'), headers={{'Content-Type':'application/json'}})
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
-            opener.open(req, timeout=10)
-            print('[OK] 成功同步 CodeBuddy / WorkBuddy 账号')
-except Exception as e:
-    print('CodeBuddy:', e)
-
-# 2. 探测 TRAE
-try:
-    candidates = [
-        os.path.join(os.environ.get('APPDATA', ''), 'TRAE SOLO CN', 'User', 'globalStorage', 'storage.json'),
-        os.path.join(os.environ.get('APPDATA', ''), 'Trae CN', 'User', 'globalStorage', 'storage.json')
-    ]
-    for sp in candidates:
-        if os.path.exists(sp):
-            d = json.load(open(sp, encoding='utf-8'))
-            m = re.search(r'\\\"token\\\"\\\\s*:\\\\s*\\\"([^\\\"]+)\\\"', open(sp, encoding='utf-8', errors='ignore').read())
-            if m:
-                t = m.group(1)
-                req = urllib.request.Request('http://{host}/api/account/save?key={admin_key}', data=json.dumps({{'platform':'trae', 'accessToken':t, 'remark':'本机 TRAE 客户端'}}).encode('utf-8'), headers={{'Content-Type':'application/json'}})
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
-                opener.open(req, timeout=10)
-                print('[OK] 成功同步 TRAE 账号')
-                break
-except Exception as e:
-    print('TRAE:', e)
-"
-
-echo.
-echo ================================================================
-echo 同步完成！刷新网页控制台即可看到最新账号与算力。
-echo ================================================================
-pause
-"""
+            bat_lines = [
+                "@echo off",
+                "chcp 936 >nul",
+                "title AI-Credits-Hub 本机多账号一键同步工具",
+                "echo ================================================================",
+                "echo       AI 算力与积分智能管家 · 本机账号一键同步",
+                "echo ================================================================",
+                "echo.",
+                "echo 正在自动探测本机 CodeBuddy / WorkBuddy、TRAE 和 Qoder 客户端凭据...",
+                "echo.",
+                'if not exist "%~dp0local_extract.py" (',
+                '    echo [1/2] 正在拉取最新的凭据提取引擎...',
+                f"    powershell -NoProfile -Command \"(New-Object Net.WebClient).DownloadFile('http://{host}/api/download/local-extract', '%~dp0local_extract.py')\"",
+                ")",
+                f'python "%~dp0local_extract.py" --server http://{host} --key {admin_key} --push',
+                "echo.",
+                "echo ================================================================",
+                "echo 同步执行完毕！请刷新云端智能管家控制台查看最新状态。",
+                "echo ================================================================",
+                "pause"
+            ]
+            bat_code = "\r\n".join(bat_lines) + "\r\n"
             self.send_response(200)
-            self.send_header("Content-Type", "application/x-bat; charset=utf-8")
-            self.send_header("Content-Disposition", 'attachment; filename="ai_sync.bat"')
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", "attachment; filename=sync.bat")
             self.end_headers()
-            self.wfile.write(bat_code.encode("utf-8"))
+            self.wfile.write(bat_code.encode("gbk", errors="replace"))
 
         elif p == "/api/data":
             force_refresh = query.get("refresh", [""])[0] in ("1", "true")
@@ -1668,7 +1881,7 @@ pause
             platform = body.get("platform")
             acc_id = body.get("id")
             new_remark = (body.get("remark") or "").strip()
-            if platform not in ("codebuddy", "trae"):
+            if platform not in ("codebuddy", "trae", "qoder"):
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -1721,7 +1934,7 @@ pause
 
         elif p == "/api/account/save":
             platform = body.get("platform")
-            if platform not in ("codebuddy", "trae"):
+            if platform not in ("codebuddy", "trae", "qoder"):
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -1816,6 +2029,33 @@ pause
                 if not account_data["phone"] and test_res.get("phone"):
                     account_data["phone"] = test_res.get("phone")
 
+            elif platform == "qoder":
+                token = (body.get("token") or body.get("accessToken") or "").strip()
+                if not token:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Qoder Token 不能为空"}).encode("utf-8"))
+                    return
+                account_data["token"] = token
+                account_data["refreshToken"] = body.get("refreshToken", "").strip()
+                account_data["uid"] = str(body.get("uid", "")).strip()
+                account_data["name"] = body.get("name", "").strip()
+                account_data["phone"] = body.get("phone", "").strip()
+                test_res = fetch_single_qoder(account_data)
+                if not test_res.get("valid"):
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": f"Qoder Token 校验失败: {test_res.get('status_text')}"}).encode("utf-8"))
+                    return
+                if not account_data["phone"] and test_res.get("phone"):
+                    account_data["phone"] = test_res.get("phone")
+                if not account_data["name"] and test_res.get("name"):
+                    account_data["name"] = test_res.get("name")
+
             # 智能防重：根据 id 或平台的唯一 uid 匹配已有账号进行就地更新
             target_uid = account_data.get("uid")
             existing_idx = next(
@@ -1832,7 +2072,9 @@ pause
                     incoming_remark in ("账号", "本机自动提取账号") or
                     incoming_remark.startswith("TRAE (") or
                     incoming_remark.startswith("CodeBuddy (") or
-                    incoming_remark.startswith("WorkBuddy客户端 (")
+                    incoming_remark.startswith("WorkBuddy客户端 (") or
+                    incoming_remark.startswith("Qoder (") or
+                    incoming_remark.startswith("Qoder CN (")
                 )
                 if old_acc.get("is_custom_remark") or (old_acc.get("remark") and is_auto_generated):
                     account_data["remark"] = old_acc.get("remark")

