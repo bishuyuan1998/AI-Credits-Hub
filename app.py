@@ -537,6 +537,8 @@ def fetch_single_qoder(acc):
 
     return res
 
+DEFAULT_QODER_CAMPAIGN_ID = "01a1bbe3-30ba-72fc-b08c-77074f059623"
+
 def checkin_qoder_account(acc):
     token = (acc.get("token") or acc.get("accessToken") or "").strip()
     if not token or not acc.get("enabled", True):
@@ -562,14 +564,19 @@ def checkin_qoder_account(acc):
                             return "今日已领 100 Credits (无需重复领取)"
                         break
 
+        # 若未在个人活动列表中返回，使用默认每日打卡活动 ID
         if not campaign_id:
-            return "未找到当前可领取的 100 Credits 活动"
+            campaign_id = DEFAULT_QODER_CAMPAIGN_ID
 
         r_claim = s.post(f"https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/{campaign_id}/claim", headers=headers, json={}, timeout=8)
         if r_claim.status_code == 200:
             cres = r_claim.json()
             if cres.get("replayed"):
-                return "今日已领 100 Credits (今日已领过)"
+                return "今日已领 100 Credits (无需重复领取)"
+            if cres.get("failureCode") == "SAME_PERSON_ALREADY_CLAIMED":
+                return "今日已领 100 Credits (同实名认证已领取)"
+            if cres.get("status") == "BLOCKED":
+                return f"领取受限: {cres.get('failureCode', '风控保护')}"
             return "🎉 成功领取今日 100 Credits 算力！"
         return f"HTTP {r_claim.status_code}: {r_claim.text[:50]}"
     except Exception as e:
