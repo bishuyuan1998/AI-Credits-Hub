@@ -593,6 +593,13 @@ def execute_all_checkin():
             res = checkin_trae_account(acc)
             results.append(f"TRAE [{acc.get('remark')}]: {res}")
 
+    # Qoder 批量签到
+    qoder_accounts = cfg.get("qoder_accounts", [])
+    for acc in qoder_accounts:
+        if acc.get("enabled", True) and (acc.get("token") or acc.get("accessToken")):
+            res = checkin_qoder_account(acc)
+            results.append(f"Qoder [{acc.get('remark')}]: {res}")
+
     summary = " | ".join(results) if results else "暂无已启用的有效账号"
     log(f"[多账号签到执行完毕] {summary}")
     return summary
@@ -1540,7 +1547,7 @@ HTML_PAGE = """<!DOCTYPE html>
     });
 
     async function editAccount(platform, id) {
-      const list = platform === 'codebuddy' ? globalData.codebuddy_accounts : globalData.trae_accounts;
+      const list = platform === 'codebuddy' ? (globalData.codebuddy_accounts || []) : (platform === 'qoder' ? (globalData.qoder_accounts || []) : (globalData.trae_accounts || []));
       const acc = list.find(a => a.id === id);
       if (!acc) return;
       document.getElementById('accModalTitle').innerHTML = '<i class="fa-solid fa-pen-to-square text-indigo-400"></i> 编辑账号凭据';
@@ -1868,6 +1875,8 @@ class Handler(BaseHTTPRequestHandler):
                 res_msg = checkin_codebuddy_account(acc)
             elif platform == "trae":
                 res_msg = checkin_trae_account(acc)
+            elif platform == "qoder":
+                res_msg = checkin_qoder_account(acc)
             else:
                 res_msg = "未知平台"
             update_cache()
