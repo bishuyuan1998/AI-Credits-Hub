@@ -851,6 +851,50 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 模态框：快速修改账号备注 -->
+  <div id="remarkModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="glass max-w-md w-full p-6 rounded-2xl shadow-2xl space-y-5 border border-slate-700/80">
+      <div class="flex justify-between items-center border-b border-slate-700/60 pb-3">
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-pen-to-square text-indigo-400"></i> 修改账号备注
+          </h3>
+          <p id="remarkModalSubtitle" class="text-xs text-slate-400 mt-0.5">为账号设置个性化备注，方便区分多账号</p>
+        </div>
+        <button onclick="closeRemarkModal()" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <input type="hidden" id="remark_platform" value="">
+      <input type="hidden" id="remark_acc_id" value="">
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-300 font-medium mb-1.5">账号自定义备注名称：</label>
+          <input type="text" id="remark_input" placeholder="例如: TRAE主号 (大号) / 自用小号 / 工作号" 
+            class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-white text-sm focus:outline-none focus:border-indigo-500 font-medium">
+        </div>
+
+        <div>
+          <span class="text-[11px] text-slate-400 mb-1.5 block">快捷预设标签（点击填入）：</span>
+          <div class="flex flex-wrap gap-1.5">
+            <button type="button" onclick="setPresetRemark('TRAE 主号 (主力开发)')" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600/30 hover:border-indigo-500/50 text-slate-300 border border-slate-700 text-[11px] transition-all">TRAE 主号</button>
+            <button type="button" onclick="setPresetRemark('TRAE 小号 (自用备用)')" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600/30 hover:border-indigo-500/50 text-slate-300 border border-slate-700 text-[11px] transition-all">TRAE 小号</button>
+            <button type="button" onclick="setPresetRemark('TRAE 体验号')" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600/30 hover:border-indigo-500/50 text-slate-300 border border-slate-700 text-[11px] transition-all">TRAE 体验号</button>
+            <button type="button" onclick="setPresetRemark('CodeBuddy 主号')" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600/30 hover:border-indigo-500/50 text-slate-300 border border-slate-700 text-[11px] transition-all">CodeBuddy 主号</button>
+            <button type="button" onclick="setPresetRemark('WorkBuddy 小号')" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600/30 hover:border-indigo-500/50 text-slate-300 border border-slate-700 text-[11px] transition-all">WorkBuddy 小号</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-3 pt-3 border-t border-slate-700/60">
+        <button type="button" onclick="closeRemarkModal()" class="px-4 py-2 glass hover:bg-slate-700/50 rounded-xl text-slate-300 text-xs font-medium">取消</button>
+        <button type="button" id="saveRemarkBtn" onclick="submitRemarkChange()" class="px-5 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-1.5">
+          <i class="fa-solid fa-floppy-disk"></i> 保存备注
+        </button>
+      </div>
+    </div>
+  </div>
+
   <script>
     window.__ADMIN_KEY__ = "{{ADMIN_KEY}}";
     let globalData = null;
@@ -983,8 +1027,13 @@ HTML_PAGE = """<!DOCTYPE html>
           <div>
             <div class="flex justify-between items-start gap-2 mb-3">
               <div>
-                <h3 class="font-bold text-base text-white flex items-center gap-2">
-                  ${acc.remark}
+                <h3 class="font-bold text-base text-white flex items-center gap-2 group">
+                  <span class="hover:text-indigo-300 cursor-pointer transition-colors" onclick="openRemarkModal('${platform}', '${acc.id}')" title="点击直接修改备注">
+                    ${acc.remark}
+                  </span>
+                  <button type="button" onclick="openRemarkModal('${platform}', '${acc.id}')" class="opacity-60 hover:opacity-100 text-xs text-indigo-400 hover:text-indigo-200 transition-all p-1" title="修改备注">
+                    <i class="fa-solid fa-pen-to-square"></i>
+                  </button>
                   ${!acc.enabled ? '<span class="text-[10px] bg-slate-700 text-slate-400 px-1.5 py-0.5 rounded">已暂停</span>' : ''}
                 </h3>
                 <div class="flex items-center gap-2 text-xs text-slate-400 mt-1 flex-wrap">
@@ -1022,13 +1071,16 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
           </div>
 
-          <div class="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between">
+          <div class="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between gap-2 flex-wrap">
             <button onclick="triggerCheckinSingle('${platform}', '${acc.id}')" class="px-3 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all">
               <i class="fa-solid fa-bolt text-emerald-400"></i> 单独签到
             </button>
             <div class="flex items-center gap-2">
-              <button onclick="editAccount('${platform}', '${acc.id}')" class="p-1.5 text-slate-400 hover:text-white glass rounded-lg" title="编辑账号">
-                <i class="fa-solid fa-pen-to-square"></i>
+              <button onclick="openRemarkModal('${platform}', '${acc.id}')" class="px-2.5 py-1.5 glass hover:bg-slate-700/60 text-slate-300 hover:text-white rounded-lg text-xs flex items-center gap-1.5 transition-all" title="修改备注">
+                <i class="fa-solid fa-pen text-indigo-400"></i> 修改备注
+              </button>
+              <button onclick="editAccount('${platform}', '${acc.id}')" class="p-1.5 text-slate-400 hover:text-white glass rounded-lg" title="完整凭据设置">
+                <i class="fa-solid fa-gear"></i>
               </button>
               <button onclick="deleteAccount('${platform}', '${acc.id}')" class="p-1.5 text-slate-400 hover:text-rose-400 glass rounded-lg" title="删除账号">
                 <i class="fa-solid fa-trash-can"></i>
@@ -1177,6 +1229,84 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
+        // 快速备注修改逻辑
+    function openRemarkModal(platform, id) {
+      const list = platform === 'codebuddy' ? globalData?.codebuddy_accounts : globalData?.trae_accounts;
+      const acc = (list || []).find(a => a.id === id);
+      if (!acc) return;
+      document.getElementById('remark_platform').value = platform;
+      document.getElementById('remark_acc_id').value = id;
+      const input = document.getElementById('remark_input');
+      input.value = acc.remark || '';
+      
+      const platName = platform === 'trae' ? '字节跳动 TRAE CN' : '腾讯 CodeBuddy / WorkBuddy';
+      const uidText = acc.uid ? ` (UID: ${acc.uid})` : '';
+      document.getElementById('remarkModalSubtitle').innerText = `${platName}${uidText}`;
+
+      document.getElementById('remarkModal').classList.remove('hidden');
+      setTimeout(() => {
+        input.focus();
+        input.select();
+      }, 50);
+    }
+
+    function closeRemarkModal() {
+      document.getElementById('remarkModal').classList.add('hidden');
+    }
+
+    function setPresetRemark(text) {
+      const input = document.getElementById('remark_input');
+      input.value = text;
+      input.focus();
+    }
+
+    async function submitRemarkChange() {
+      const platform = document.getElementById('remark_platform').value;
+      const id = document.getElementById('remark_acc_id').value;
+      const remark = document.getElementById('remark_input').value.trim();
+      if (!remark) {
+        alert('请输入备注名称！');
+        return;
+      }
+
+      const btn = document.getElementById('saveRemarkBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 保存中...';
+
+      try {
+        const res = await apiFetch('/api/account/remark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ platform, id, remark })
+        });
+        const d = await res.json();
+        if (d.success) {
+          closeRemarkModal();
+          loadData(false);
+        } else {
+          alert('修改备注失败: ' + (d.error || d.message));
+        }
+      } catch (e) {
+        alert('网络请求异常: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存备注';
+      }
+    }
+
+    // 支持在备注框直接回车保存
+    document.addEventListener('DOMContentLoaded', () => {
+      const el = document.getElementById('remark_input');
+      if (el) {
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            submitRemarkChange();
+          }
+        });
+      }
+    });
+
     async function editAccount(platform, id) {
       const list = platform === 'codebuddy' ? globalData.codebuddy_accounts : globalData.trae_accounts;
       const acc = list.find(a => a.id === id);
@@ -1209,7 +1339,7 @@ HTML_PAGE = """<!DOCTYPE html>
         deviceId: document.getElementById('acc_trae_did').value.trim() || '766820083601979'
       };
 
-      if (!payload.accessToken) {
+      if (!payload.accessToken && !payload.id) {
         alert('请填写 AccessToken');
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 验证并保存到服务器';
@@ -1534,6 +1664,61 @@ pause
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "message": res_msg}, ensure_ascii=False).encode("utf-8"))
 
+        elif p == "/api/account/remark":
+            platform = body.get("platform")
+            acc_id = body.get("id")
+            new_remark = (body.get("remark") or "").strip()
+            if platform not in ("codebuddy", "trae"):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "不支持的平台"}).encode("utf-8"))
+                return
+            if not acc_id:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "缺少账号 ID"}).encode("utf-8"))
+                return
+            if not new_remark:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "备注不能为空"}).encode("utf-8"))
+                return
+
+            cfg = load_config()
+            key_name = f"{platform}_accounts"
+            if key_name not in cfg:
+                cfg[key_name] = []
+
+            matched = False
+            for acc in cfg[key_name]:
+                if acc.get("id") == acc_id:
+                    acc["remark"] = new_remark
+                    acc["is_custom_remark"] = True
+                    matched = True
+                    break
+
+            if not matched:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "未找到指定账号"}).encode("utf-8"))
+                return
+
+            save_config(cfg)
+            update_cache()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "remark": new_remark}, ensure_ascii=False).encode("utf-8"))
+
         elif p == "/api/account/save":
             platform = body.get("platform")
             if platform not in ("codebuddy", "trae"):
@@ -1549,7 +1734,40 @@ pause
             if key_name not in cfg:
                 cfg[key_name] = []
 
+            acc_id = body.get("id")
             token = body.get("accessToken", "").strip()
+
+            # 若编辑已有账号且未填写 token，直接就地更新备注与基础属性，无需重新校验 token
+            if acc_id and not token:
+                matched = False
+                for acc in cfg[key_name]:
+                    if acc.get("id") == acc_id:
+                        if body.get("remark"):
+                            acc["remark"] = body.get("remark").strip()
+                            acc["is_custom_remark"] = True
+                        if "phone" in body:
+                            acc["phone"] = body.get("phone", "").strip()
+                        if "enabled" in body:
+                            acc["enabled"] = bool(body.get("enabled"))
+                        matched = True
+                        break
+                if matched:
+                    save_config(cfg)
+                    update_cache()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": acc_id}).encode("utf-8"))
+                    return
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "未找到指定账号"}).encode("utf-8"))
+                    return
+
             if not token:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1607,8 +1825,18 @@ pause
             if existing_idx >= 0:
                 old_acc = cfg[key_name][existing_idx]
                 account_data["id"] = old_acc.get("id", acc_id)
-                if old_acc.get("remark") and (body.get("remark") in ("账号", "本机自动提取账号", "") or not body.get("remark")):
+                # 若已有自定义备注，且当前推送的是系统自动探测默认格式的备注，则保持自定义备注不变
+                incoming_remark = body.get("remark", "")
+                is_auto_generated = (
+                    not incoming_remark or
+                    incoming_remark in ("账号", "本机自动提取账号") or
+                    incoming_remark.startswith("TRAE (") or
+                    incoming_remark.startswith("CodeBuddy (") or
+                    incoming_remark.startswith("WorkBuddy客户端 (")
+                )
+                if old_acc.get("is_custom_remark") or (old_acc.get("remark") and is_auto_generated):
                     account_data["remark"] = old_acc.get("remark")
+                    account_data["is_custom_remark"] = True
                 cfg[key_name][existing_idx] = account_data
             else:
                 cfg[key_name].append(account_data)

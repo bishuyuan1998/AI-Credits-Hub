@@ -6,9 +6,10 @@
 ====================================================================
 功能：
   • 自动探测本机安装的 CodeBuddy / WorkBuddy 与 TRAE 客户端
-  • 纯标准库内置 AES-128-CBC 算法自解密，零第三方复杂依赖
-  • 自动提取当前账号凭据，支持追加到多账号池
-  • 支持一键推送到远程云服务器智能管家
+  • 支持多账号自动发现（主号、小号、多客户端多实例）
+  • 纯标准库内置 AES-128-CBC 算法自解密 TRAE 凭据
+  • 智能调用 WorkBuddy 内核引擎自解密 WorkBuddy 最新凭据
+  • 自动追加/更新本地账号池并一键直连同步至云端智能管家
 ====================================================================
 """
 
@@ -19,6 +20,7 @@ import base64
 import hashlib
 import re
 import uuid
+import subprocess
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -108,13 +110,114 @@ def decrypt_trae_storage_value(b64):
         return pt[:-pad]
     return pt.rstrip(b"\x00").rstrip()
 
+def extract_workbuddy_desktop():
+    """使用 WorkBuddy 自带的 Node 运行环境解密 workbuddy-desktop.info 凭据"""
+    wb_candidates = [
+        r"D:\WorkBuddy\WorkBuddy.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
+        os.path.expandvars(r"%PROGRAMFILES%\WorkBuddy\WorkBuddy.exe")
+    ]
+    wb_exe = next((p for p in wb_candidates if os.path.exists(p)), None)
+    if not wb_exe:
+        return []
+
+    app_asar = os.path.join(os.path.dirname(wb_exe), "resources", "app.asar")
+    if not os.path.exists(app_asar):
+        return []
+
+    info_path = os.path.expandvars(r"%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info")
+    if not os.path.exists(info_path):
+        return []
+
+    js_code = f"""
+const fs = require('fs');
+const path = require('path');
+
+try {{
+  const binding = process._linkedBinding("electron_browser_workbuddy_storage");
+  const rawLogger = binding.loggerGet();
+  const mainDir = '{app_asar.replace("\\", "/")}/main';
+  const require_dist = require(path.join(mainDir, 'dist.js'));
+  const cp = require(path.join(mainDir, 'credential-protection.js'));
+  cp.t();
+
+  const configDir = path.join(process.env.USERPROFILE, '.workbuddy');
+  const i = require_dist.T(rawLogger);
+  const protectorKey = i.symmetric.value;
+
+  let userKey = null;
+  const keyblobPath = require_dist.l(configDir);
+  if (fs.existsSync(keyblobPath)) {{
+    const o = require_dist.u({{ keyblobPath, protectorKey }});
+    if (o.status === 'ready') {{
+      userKey = o.value;
+    }}
+  }}
+
+  const bootstrap = {{
+    policy: 'required',
+    symmetricKey: protectorKey,
+    ...(userKey ? {{ userKey }} : {{}}),
+    ...(i.developerPublicKey.status === 'ready' ? {{ developerPublicKey: i.developerPublicKey.value }} : {{}})
+  }};
+
+  cp._(bootstrap);
+
+  const authPath = '{info_path.replace("\\", "/")}';
+  const authRaw = fs.readFileSync(authPath, 'utf8');
+  const codec = cp.v({{
+    purpose: 'workbuddy-auth-session',
+    resourceId: 'auth/workbuddy-desktop.info'
+  }});
+
+  try {{
+    const decoded = codec.decode(JSON.parse(authRaw), cp.l);
+    const session = decoded.value;
+    const res = {{
+      uid: session?.account?.uid || '',
+      nickname: session?.account?.nickname || '',
+      phone: session?.account?.phoneNumber || '',
+      accessToken: session?.auth?.accessToken || '',
+      refreshToken: session?.auth?.refreshToken || ''
+    }};
+    process.stdout.write(JSON.stringify(res));
+  }} finally {{
+    codec.dispose();
+  }}
+}} catch (e) {{
+  process.stderr.write(e.message || String(e));
+}}
+process.exit(0);
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+
+    try:
+        proc = subprocess.run(
+            [wb_exe, "-e", js_code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            acc = json.loads(proc.stdout.strip())
+            if acc.get("accessToken"):
+                acc["source"] = "WorkBuddy客户端"
+                return [acc]
+    except Exception as e:
+        print(f"  ⚠️ WorkBuddy 桌面端凭据解析异常: {e}")
+    return []
+
 def extract_all():
     extracted = {
-        "codebuddy": {},
-        "trae": {}
+        "codebuddy": [],
+        "trae": []
     }
+    seen_cb_uids = set()
+    seen_trae_uids = set()
 
-    # 1. 提取 CodeBuddy
+    # 1. 提取 CodeBuddy 扩展插件凭据 (旧版/插件明文存储)
     local_app_data = os.getenv("LOCALAPPDATA", "")
     if local_app_data:
         cb_path = os.path.join(local_app_data, "CodeBuddyExtension", "Data", "Public", "auth", "Tencent-Cloud.coding-copilot.info")
@@ -122,24 +225,41 @@ def extract_all():
             try:
                 with open(cb_path, "r", encoding="utf-8") as f:
                     cb_json = json.load(f)
-                extracted["codebuddy"] = {
-                    "accessToken": cb_json.get("auth", {}).get("accessToken", ""),
-                    "refreshToken": cb_json.get("auth", {}).get("refreshToken", ""),
-                    "nickname": cb_json.get("account", {}).get("nickname", "腾讯用户"),
-                    "uid": cb_json.get("account", {}).get("uid", "")
-                }
-                print("✅ 成功提取 CodeBuddy / WorkBuddy 本机登录凭据")
+                uid = cb_json.get("account", {}).get("uid", "")
+                at = cb_json.get("auth", {}).get("accessToken", "")
+                if at:
+                    extracted["codebuddy"].append({
+                        "accessToken": at,
+                        "refreshToken": cb_json.get("auth", {}).get("refreshToken", ""),
+                        "nickname": cb_json.get("account", {}).get("nickname", "腾讯用户"),
+                        "phone": cb_json.get("account", {}).get("phoneNumber", ""),
+                        "uid": uid,
+                        "source": "CodeBuddy插件"
+                    })
+                    if uid: seen_cb_uids.add(uid)
+                    print(f"✅ 成功提取 CodeBuddy 插件登录凭据 (UID: {uid[:8]}...)")
             except Exception as e:
-                print(f"⚠️ 读取 CodeBuddy 失败: {e}")
+                print(f"⚠️ 读取 CodeBuddy 插件凭据失败: {e}")
 
-    # 2. 提取 TRAE
+    # 2. 提取 WorkBuddy 桌面客户端凭据 (新版安全加密存储)
+    wb_accounts = extract_workbuddy_desktop()
+    for acc in wb_accounts:
+        uid = acc.get("uid", "")
+        if uid and uid not in seen_cb_uids:
+            seen_cb_uids.add(uid)
+            extracted["codebuddy"].append(acc)
+            print(f"✅ 成功解密 WorkBuddy 桌面客户端登录凭据 (账号: {acc.get('nickname')}, UID: {uid[:8]}...)")
+        elif not uid:
+            extracted["codebuddy"].append(acc)
+
+    # 3. 提取 TRAE 凭据 (扫描所有安装实例：TRAE SOLO CN / Trae CN)
     appdata = os.getenv("APPDATA", "")
     if appdata:
         trae_candidates = [
-            os.path.join(appdata, "TRAE SOLO CN", "User", "globalStorage", "storage.json"),
-            os.path.join(appdata, "Trae CN", "User", "globalStorage", "storage.json")
+            ("TRAE SOLO CN", os.path.join(appdata, "TRAE SOLO CN", "User", "globalStorage", "storage.json")),
+            ("Trae CN", os.path.join(appdata, "Trae CN", "User", "globalStorage", "storage.json"))
         ]
-        for sp in trae_candidates:
+        for name, sp in trae_candidates:
             if os.path.exists(sp):
                 try:
                     with open(sp, "r", encoding="utf-8") as f:
@@ -150,38 +270,50 @@ def extract_all():
                         at = re.search(r'"token"\s*:\s*"([^"]+)"', dec)
                         rt = re.search(r'"refreshToken"\s*:\s*"([^"]+)"', dec)
                         uid = re.search(r'"userId"\s*:\s*"(\d+)"', dec)
-                        
+
                         real_device_id = "766820083601979"
                         for k in t_json.keys():
                             if k.startswith("iCubeAuthInfo://icube-dc:"):
                                 real_device_id = k.split(":")[-1]
                                 break
-                                
-                        extracted["trae"] = {
-                            "accessToken": at.group(1) if at else "",
-                            "refreshToken": rt.group(1) if rt else "",
-                            "uid": uid.group(1) if uid else "",
-                            "deviceId": real_device_id
-                        }
-                        print("✅ 成功提取 TRAE 本机登录凭据与设备指纹")
-                        break
+
+                        uid_val = uid.group(1) if uid else ""
+                        if at and at.group(1):
+                            if uid_val not in seen_trae_uids:
+                                seen_trae_uids.add(uid_val)
+                                extracted["trae"].append({
+                                    "accessToken": at.group(1),
+                                    "refreshToken": rt.group(1) if rt else "",
+                                    "uid": uid_val,
+                                    "deviceId": real_device_id,
+                                    "source": name
+                                })
+                                print(f"✅ 成功提取 [{name}] 登录凭据 (UID: {uid_val})")
                 except Exception as e:
-                    print(f"⚠️ 读取 TRAE 失败: {e}")
+                    print(f"⚠️ 读取 TRAE [{name}] 失败: {e}")
 
     return extracted
 
 def push_to_remote(server_url, key, platform, acc_data):
     try:
         import urllib.request
-        # 禁用系统代理，直连服务器，避免受到本地科学上网/VPN 拦截导致 503
         no_proxy_handler = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(no_proxy_handler)
-        
+
         sep = "&" if "?" in server_url else "?"
         url = server_url.rstrip("/") + f"/api/account/save{sep}key={key}"
+        
+        remark = acc_data.get("remark")
+        if not remark:
+            if platform == "codebuddy":
+                nick = acc_data.get("nickname") or acc_data.get("phone") or "用户"
+                remark = f"{acc_data.get('source', 'CodeBuddy')} ({nick})"
+            else:
+                remark = f"TRAE ({acc_data.get('source', '客户端')} UID: {acc_data.get('uid')})"
+
         payload = {
             "platform": platform,
-            "remark": acc_data.get("remark") or acc_data.get("nickname") or "本机自动提取账号",
+            "remark": remark,
             "phone": acc_data.get("phone", ""),
             "accessToken": acc_data.get("accessToken", ""),
             "refreshToken": acc_data.get("refreshToken", ""),
@@ -200,11 +332,14 @@ def push_to_remote(server_url, key, platform, acc_data):
         with opener.open(req, timeout=10) as resp:
             res = json.loads(resp.read().decode("utf-8"))
             if res.get("success"):
-                print(f"  ☁️ 远程同步成功 [{platform}]: {res.get('message', '账号已同步')}")
+                print(f"  ☁️  远程同步成功 [{platform}] {payload['remark']}: {res.get('message', '账号已入库')}")
+                return True
             else:
-                print(f"  ⚠️ 远程同步失败 [{platform}]: {res.get('error')}")
+                print(f"  ⚠️  远程同步失败 [{platform}] {payload['remark']}: {res.get('error')}")
+                return False
     except Exception as e:
         print(f"  ❌ 远程推送失败 [{platform}]: {e}")
+        return False
 
 def main():
     import argparse
@@ -222,7 +357,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_file = os.path.join(script_dir, "config.json")
 
-    # 读取已有配置
+    # 读取本地已有配置
     cfg = {"auth": {"admin_key": "Hub_98bxy_Sec2026"}, "codebuddy_accounts": [], "trae_accounts": []}
     if os.path.exists(out_file):
         try:
@@ -236,36 +371,40 @@ def main():
     if "trae_accounts" not in cfg:
         cfg["trae_accounts"] = []
 
-    # 追加或更新 CodeBuddy 账号
-    if data.get("codebuddy", {}).get("accessToken"):
-        cb = data["codebuddy"]
+    # 追加或更新所有 CodeBuddy 账号
+    for cb in data.get("codebuddy", []):
         cb_uid = cb.get("uid", "")
         existing = next((a for a in cfg["codebuddy_accounts"] if a.get("uid") == cb_uid and cb_uid), None)
         if existing:
             existing["accessToken"] = cb["accessToken"]
-            existing["nickname"] = cb.get("nickname", "用户")
+            existing["refreshToken"] = cb.get("refreshToken", "")
+            existing["nickname"] = cb.get("nickname", existing.get("nickname", "用户"))
+            existing["phone"] = cb.get("phone", existing.get("phone", ""))
         else:
+            nick = cb.get("nickname") or cb.get("phone") or "用户"
             cfg["codebuddy_accounts"].append({
                 "id": "cb_" + uuid.uuid4().hex[:8],
-                "remark": f"本机 CodeBuddy ({cb.get('nickname', '主号')})",
+                "remark": f"{cb.get('source', 'CodeBuddy')} ({nick})",
                 "accessToken": cb["accessToken"],
                 "refreshToken": cb.get("refreshToken", ""),
-                "nickname": cb.get("nickname", "用户"),
+                "nickname": nick,
+                "phone": cb.get("phone", ""),
                 "uid": cb_uid,
                 "enabled": True
             })
 
-    # 追加或更新 TRAE 账号
-    if data.get("trae", {}).get("accessToken"):
-        trae = data["trae"]
+    # 追加或更新所有 TRAE 账号
+    for trae in data.get("trae", []):
         trae_uid = trae.get("uid", "")
         existing = next((a for a in cfg["trae_accounts"] if a.get("uid") == trae_uid and trae_uid), None)
         if existing:
             existing["accessToken"] = trae["accessToken"]
+            existing["refreshToken"] = trae.get("refreshToken", "")
+            existing["deviceId"] = trae.get("deviceId", "766820083601979")
         else:
             cfg["trae_accounts"].append({
                 "id": "trae_" + uuid.uuid4().hex[:8],
-                "remark": f"本机 TRAE (UID: {trae_uid})",
+                "remark": f"{trae.get('source', 'TRAE')} (UID: {trae_uid})",
                 "accessToken": trae["accessToken"],
                 "refreshToken": trae.get("refreshToken", ""),
                 "uid": trae_uid,
@@ -277,6 +416,7 @@ def main():
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
     print(f"\n🎉 凭证已成功保存至本地配置文件: {out_file}")
+    print(f"📊 当前识别到本地有效账号数: CodeBuddy/WorkBuddy x {len(data['codebuddy'])} 个, TRAE x {len(data['trae'])} 个")
 
     remote = args.server
     key = args.key
@@ -290,11 +430,17 @@ def main():
 
     if remote:
         print(f"\n正在同步到云端服务器: {remote} ...")
-        if data.get("codebuddy", {}).get("accessToken"):
-            push_to_remote(remote, key, "codebuddy", data["codebuddy"])
-        if data.get("trae", {}).get("accessToken"):
-            push_to_remote(remote, key, "trae", data["trae"])
-        print("✅ 远程多账号同步完成！")
+        for cb in data.get("codebuddy", []):
+            existing = next((a for a in cfg.get("codebuddy_accounts", []) if a.get("uid") == cb.get("uid") and cb.get("uid")), None)
+            if existing and existing.get("remark"):
+                cb["remark"] = existing["remark"]
+            push_to_remote(remote, key, "codebuddy", cb)
+        for trae in data.get("trae", []):
+            existing = next((a for a in cfg.get("trae_accounts", []) if a.get("uid") == trae.get("uid") and trae.get("uid")), None)
+            if existing and existing.get("remark"):
+                trae["remark"] = existing["remark"]
+            push_to_remote(remote, key, "trae", trae)
+        print("\n✅ 所有账号远程多账号同步完成！")
 
     print("=" * 64)
 
