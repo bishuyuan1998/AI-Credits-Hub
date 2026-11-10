@@ -422,6 +422,8 @@ def checkin_codebuddy_account(acc):
             r = s.post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin", headers=headers, timeout=8)
             if r.status_code == 200:
                 return r.json().get("msg", "签到成功")
+            elif r.status_code == 400 and ("已签到" in r.text or r.json().get("code") == 10001):
+                return "今日已签到 (无需重复领取)"
             elif r.status_code in (500, 502, 503, 504) and attempt < 3:
                 time.sleep(2)
                 continue
@@ -503,6 +505,7 @@ def fetch_single_qoder(acc):
     }
 
     # 1. 查询活动与今日签到状态 (每天领 100 Credits)
+    has_same_person_claimed = False
     try:
         r_camp = s.get("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", headers=headers, timeout=8)
         if r_camp.status_code == 200:
@@ -512,6 +515,10 @@ def fetch_single_qoder(acc):
                     res["campaign_id"] = c.get("campaignId", "")
                     res["today_checked"] = (c.get("claimStatus") == "CLAIMED")
                     break
+            # 若活动不可领且活动列表中无待领 CREDITS，判断是否为同实名今日已领
+            if not cdata.get("claimable", True) and not res["today_checked"]:
+                res["today_checked"] = True
+                has_same_person_claimed = True
     except Exception:
         pass
 
@@ -543,7 +550,7 @@ def fetch_single_qoder(acc):
                 res["expire_time"] = "30天滚动有效"
                 res["expire_days"] = 30
                 
-            res["status_text"] = "今日已领 100 Credits" if res["today_checked"] else "待领取 100 Credits"
+            res["status_text"] = ("今日已领 (同实名已领)" if has_same_person_claimed else "今日已领 100 Credits") if res["today_checked"] else "待领取 100 Credits"
         elif r_usg.status_code == 401:
             res["status_text"] = "Token 已失效 (401)"
         else:
