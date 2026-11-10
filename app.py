@@ -417,13 +417,21 @@ def checkin_codebuddy_account(acc):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddy/1.0.0",
         "Content-Type": "application/json"
     }
-    try:
-        r = s.post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin", headers=headers, timeout=8)
-        if r.status_code == 200:
-            return r.json().get("msg", "签到成功")
-        return f"HTTP {r.status_code}"
-    except Exception as e:
-        return f"网络异常: {e}"
+    for attempt in range(1, 4):
+        try:
+            r = s.post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin", headers=headers, timeout=8)
+            if r.status_code == 200:
+                return r.json().get("msg", "签到成功")
+            elif r.status_code in (500, 502, 503, 504) and attempt < 3:
+                time.sleep(2)
+                continue
+            return f"HTTP {r.status_code}"
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(2)
+                continue
+            return f"网络异常: {e}"
+    return "重试超时"
 
 def checkin_trae_account(acc):
     token = acc.get("accessToken", "").strip()
@@ -440,13 +448,21 @@ def checkin_trae_account(acc):
         "x-os-version": "10.0.19045",
         "x-app-version": "1.107.1"
     }
-    try:
-        r = s.post("https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim", headers=headers, data='{"req_source": 1}', timeout=8)
-        if r.status_code == 200:
-            return r.json().get("message", "签到成功")
-        return f"HTTP {r.status_code}"
-    except Exception as e:
-        return f"网络异常: {e}"
+    for attempt in range(1, 4):
+        try:
+            r = s.post("https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim", headers=headers, data='{"req_source": 1}', timeout=8)
+            if r.status_code == 200:
+                return r.json().get("message", "签到成功")
+            elif r.status_code >= 500 and attempt < 3:
+                time.sleep(2)
+                continue
+            return f"HTTP {r.status_code}"
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(2)
+                continue
+            return f"网络异常: {e}"
+    return "重试超时"
 
 
 def fetch_single_qoder(acc):
@@ -537,9 +553,10 @@ def fetch_single_qoder(acc):
 
     return res
 
-DEFAULT_QODER_CAMPAIGN_ID = "01a1bbe3-30ba-72fc-b08c-77074f059623"
+LATEST_QODER_CAMPAIGN_ID = "01a1bbe3-c1f6-7e28-bc0c-8b29f9e3e2ca"
 
 def checkin_qoder_account(acc):
+    global LATEST_QODER_CAMPAIGN_ID
     token = (acc.get("token") or acc.get("accessToken") or "").strip()
     if not token or not acc.get("enabled", True):
         return "未启用或无 Token"
@@ -552,35 +569,47 @@ def checkin_qoder_account(acc):
         "Cosy-Version": "0.4.8",
         "User-Agent": "Qoder"
     }
-    try:
-        campaign_id = acc.get("campaign_id")
-        if not campaign_id:
-            r_c = s.get("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", headers=headers, timeout=8)
-            if r_c.status_code == 200:
-                for c in r_c.json().get("campaigns", []):
-                    if c.get("actionType") == "CLAIM_BENEFIT" and c.get("benefit", {}).get("kind") == "CREDITS":
-                        campaign_id = c.get("campaignId")
-                        if c.get("claimStatus") == "CLAIMED":
-                            return "今日已领 100 Credits (无需重复领取)"
-                        break
+    for attempt in range(1, 4):
+        try:
+            campaign_id = acc.get("campaign_id")
+            if not campaign_id:
+                r_c = s.get("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", headers=headers, timeout=8)
+                if r_c.status_code == 200:
+                    for c in r_c.json().get("campaigns", []):
+                        if c.get("actionType") == "CLAIM_BENEFIT" and c.get("benefit", {}).get("kind") == "CREDITS":
+                            campaign_id = c.get("campaignId")
+                            LATEST_QODER_CAMPAIGN_ID = campaign_id
+                            if c.get("claimStatus") == "CLAIMED":
+                                return "今日已领 100 Credits (无需重复领取)"
+                            break
 
-        # 若未在个人活动列表中返回，使用默认每日打卡活动 ID
-        if not campaign_id:
-            campaign_id = DEFAULT_QODER_CAMPAIGN_ID
+            # 若未在个人活动列表中返回，使用最新追踪到的活动 ID
+            if not campaign_id:
+                campaign_id = LATEST_QODER_CAMPAIGN_ID
 
-        r_claim = s.post(f"https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/{campaign_id}/claim", headers=headers, json={}, timeout=8)
-        if r_claim.status_code == 200:
-            cres = r_claim.json()
-            if cres.get("replayed"):
-                return "今日已领 100 Credits (无需重复领取)"
-            if cres.get("failureCode") == "SAME_PERSON_ALREADY_CLAIMED":
-                return "今日已领 100 Credits (同实名认证已领取)"
-            if cres.get("status") == "BLOCKED":
-                return f"领取受限: {cres.get('failureCode', '风控保护')}"
-            return "🎉 成功领取今日 100 Credits 算力！"
-        return f"HTTP {r_claim.status_code}: {r_claim.text[:50]}"
-    except Exception as e:
-        return f"网络异常: {e}"
+            if not campaign_id:
+                return "未找到当前有效 100 Credits 活动"
+
+            r_claim = s.post(f"https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/{campaign_id}/claim", headers=headers, json={}, timeout=8)
+            if r_claim.status_code == 200:
+                cres = r_claim.json()
+                if cres.get("replayed"):
+                    return "今日已领 100 Credits (无需重复领取)"
+                if cres.get("failureCode") == "SAME_PERSON_ALREADY_CLAIMED":
+                    return "今日已领 100 Credits (同实名认证已领取)"
+                if cres.get("status") == "BLOCKED":
+                    return f"领取受限: {cres.get('failureCode', '风控保护')}"
+                return "🎉 成功领取今日 100 Credits 算力！"
+            elif r_claim.status_code >= 500 and attempt < 3:
+                time.sleep(2)
+                continue
+            return f"HTTP {r_claim.status_code}: {r_claim.text[:50]}"
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(2)
+                continue
+            return f"网络异常: {e}"
+    return "重试超时"
 
 def execute_all_checkin():
     cfg = load_config()
@@ -657,22 +686,44 @@ def update_cache():
     return DATA_CACHE
 
 def scheduler_worker():
-    log("[定时任务模块启动] 守护进程持续监听每日签到时刻...")
+    log("[定时任务模块启动] 守护进程持续监听每日签到时刻 (推荐 10:05)...")
     last_run_day = None
+    last_retry_ts = 0
     while True:
         try:
             cfg = load_config()
-            hour = cfg.get("settings", {}).get("auto_checkin_hour", 9)
-            minute = cfg.get("settings", {}).get("auto_checkin_minute", 0)
+            hour = cfg.get("settings", {}).get("auto_checkin_hour", 10)
+            minute = cfg.get("settings", {}).get("auto_checkin_minute", 5)
 
             now = datetime.datetime.now()
             today_str = now.strftime("%Y-%m-%d")
 
+            # 1. 每日定时主打卡 (推荐 10:05，阿里 Qoder 每日新任务于 10:00 刷新，且避开整点网络高峰)
+            should_run = False
             if now.hour == hour and now.minute == minute and last_run_day != today_str:
+                should_run = True
+            elif (now.hour > hour or (now.hour == hour and now.minute > minute)) and last_run_day != today_str:
+                # 若系统在 10:05 之后开机/重启，自动防漏补跑一次
+                log(f"[自动防漏补签] 检测到今日尚未执行定时打卡，立即补执行...")
+                should_run = True
+
+            if should_run:
                 log(f"[触发每日定时打卡] 开始为所有账号执行签到任务...")
                 execute_all_checkin()
                 update_cache()
                 last_run_day = today_str
+
+            # 2. 智能轮询补签：白天（10点至22点）每隔 30 分钟检查是否有未签到账号，若有则自动静默补签
+            now_ts = time.time()
+            if 10 <= now.hour <= 22 and (now_ts - last_retry_ts >= 1800):
+                last_retry_ts = now_ts
+                cached = DATA_CACHE.get("summary", {})
+                tot = cached.get("total_accounts", 0)
+                chk = cached.get("today_checked_count", 0)
+                if tot > 0 and chk < tot:
+                    log(f"[智能补签轮询] 检测到当前有账号未完成今日签到 ({chk}/{tot})，尝试自动补签...")
+                    execute_all_checkin()
+                    update_cache()
 
             time.sleep(30)
         except Exception as e:
