@@ -492,24 +492,18 @@ def push_to_remote(server_url, key, platform, acc_data):
         print(f"  ❌ 远程推送准备异常 [{platform}]: {e}")
         return False
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="AI-Credits-Hub 本机凭据提取与同步")
-    parser.add_argument("--server", help="远程 Hub 服务器地址，例如 http://47.77.190.116:9527")
-    parser.add_argument("--key", help="远程 Hub 密钥", default="Hub_98bxy_Sec2026")
-    parser.add_argument("--push", action="store_true", help="是否直接推送到云端")
-    args = parser.parse_args()
-
-    print("=" * 64)
-    print("       🚀 本地 AI 客户端凭据一键提取与多账号同步工具")
-    print("=" * 64)
+def run_sync_cycle(server=None, key="Hub_98bxy_Sec2026", push=False, verbose=True):
+    if verbose:
+        print("=" * 64)
+        print("       🚀 本地 AI 客户端凭据一键提取与多账号同步工具")
+        print("=" * 64)
 
     data = extract_all()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_file = os.path.join(script_dir, "config.json")
 
     # 读取本地已有配置
-    cfg = {"auth": {"admin_key": "Hub_98bxy_Sec2026"}, "codebuddy_accounts": [], "trae_accounts": []}
+    cfg = {"auth": {"admin_key": key}, "codebuddy_accounts": [], "trae_accounts": [], "qoder_accounts": []}
     if os.path.exists(out_file):
         try:
             with open(out_file, "r", encoding="utf-8") as f:
@@ -517,12 +511,9 @@ def main():
         except Exception:
             pass
 
-    if "codebuddy_accounts" not in cfg:
-        cfg["codebuddy_accounts"] = []
-    if "trae_accounts" not in cfg:
-        cfg["trae_accounts"] = []
-    if "qoder_accounts" not in cfg:
-        cfg["qoder_accounts"] = []
+    if "codebuddy_accounts" not in cfg: cfg["codebuddy_accounts"] = []
+    if "trae_accounts" not in cfg: cfg["trae_accounts"] = []
+    if "qoder_accounts" not in cfg: cfg["qoder_accounts"] = []
 
     # 追加或更新所有 CodeBuddy 账号
     for cb in data.get("codebuddy", []):
@@ -591,11 +582,61 @@ def main():
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-    print(f"\n🎉 凭证已成功保存至本地配置文件: {out_file}")
-    print(f"📊 当前识别到本地有效账号数: CodeBuddy/WorkBuddy x {len(data['codebuddy'])} 个, TRAE x {len(data['trae'])} 个, Qoder x {len(data['qoder'])} 个")
+    if verbose:
+        print(f"\n🎉 凭证已成功保存至本地配置文件: {out_file}")
+        print(f"📊 当前识别到本地有效账号数: CodeBuddy/WorkBuddy x {len(data['codebuddy'])} 个, TRAE x {len(data['trae'])} 个, Qoder x {len(data['qoder'])} 个")
 
-    remote = args.server
+    if server:
+        if verbose:
+            print(f"\n正在同步到云端服务器: {server} ...")
+        for cb in data.get("codebuddy", []):
+            existing = next((a for a in cfg.get("codebuddy_accounts", []) if a.get("uid") == cb.get("uid") and cb.get("uid")), None)
+            if existing:
+                if existing.get("remark"): cb["remark"] = existing["remark"]
+                if existing.get("id"): cb["id"] = existing["id"]
+            push_to_remote(server, key, "codebuddy", cb)
+        for trae in data.get("trae", []):
+            existing = next((a for a in cfg.get("trae_accounts", []) if a.get("uid") == trae.get("uid") and trae.get("uid")), None)
+            if existing:
+                if existing.get("remark"): trae["remark"] = existing["remark"]
+                if existing.get("id"): trae["id"] = existing["id"]
+            push_to_remote(server, key, "trae", trae)
+        for qd in data.get("qoder", []):
+            existing = next((a for a in cfg.get("qoder_accounts", []) if a.get("uid") == qd.get("uid") and qd.get("uid")), None)
+            if existing:
+                if existing.get("remark"): qd["remark"] = existing["remark"]
+                if existing.get("id"): qd["id"] = existing["id"]
+            push_to_remote(server, key, "qoder", qd)
+        if verbose:
+            print("\n✅ 所有账号远程多账号同步完成！")
+
+    if verbose:
+        print("=" * 64)
+
+def main():
+    import argparse
+    import time
+    parser = argparse.ArgumentParser(description="AI-Credits-Hub 本机凭据提取与同步")
+    parser.add_argument("--server", help="远程 Hub 服务器地址，例如 http://47.77.190.116:9527")
+    parser.add_argument("--key", help="远程 Hub 密钥", default="Hub_98bxy_Sec2026")
+    parser.add_argument("--push", action="store_true", help="是否直接推送到云端")
+    parser.add_argument("--daemon", action="store_true", help="以静默守护模式在后台持续监听并自动同步")
+    parser.add_argument("--interval", type=int, default=1800, help="守护模式检测间隔秒数，默认 1800 秒 (30分钟)")
+    args = parser.parse_args()
+
+    remote = args.server or ("http://47.77.190.116:9527" if (args.push or args.daemon) else None)
     key = args.key
+
+    if args.daemon:
+        print(f"🛡️ [守护进程已启动] 正在后台持续监听本地凭据并自动修复云端 (间隔: {args.interval} 秒)...")
+        while True:
+            try:
+                run_sync_cycle(server=remote, key=key, push=True, verbose=False)
+            except Exception as e:
+                pass
+            time.sleep(args.interval)
+        return
+
     if not remote and not args.push:
         try:
             remote = input("\n👉 是否推送到远程云服务器？(直接回车跳过，或输入如 http://47.77.190.116:9527): ").strip()
@@ -604,35 +645,7 @@ def main():
         except (KeyboardInterrupt, EOFError):
             pass
 
-    if remote:
-        print(f"\n正在同步到云端服务器: {remote} ...")
-        for cb in data.get("codebuddy", []):
-            existing = next((a for a in cfg.get("codebuddy_accounts", []) if a.get("uid") == cb.get("uid") and cb.get("uid")), None)
-            if existing:
-                if existing.get("remark"):
-                    cb["remark"] = existing["remark"]
-                if existing.get("id"):
-                    cb["id"] = existing["id"]
-            push_to_remote(remote, key, "codebuddy", cb)
-        for trae in data.get("trae", []):
-            existing = next((a for a in cfg.get("trae_accounts", []) if a.get("uid") == trae.get("uid") and trae.get("uid")), None)
-            if existing:
-                if existing.get("remark"):
-                    trae["remark"] = existing["remark"]
-                if existing.get("id"):
-                    trae["id"] = existing["id"]
-            push_to_remote(remote, key, "trae", trae)
-        for qd in data.get("qoder", []):
-            existing = next((a for a in cfg.get("qoder_accounts", []) if a.get("uid") == qd.get("uid") and qd.get("uid")), None)
-            if existing:
-                if existing.get("remark"):
-                    qd["remark"] = existing["remark"]
-                if existing.get("id"):
-                    qd["id"] = existing["id"]
-            push_to_remote(remote, key, "qoder", qd)
-        print("\n✅ 所有账号远程多账号同步完成！")
+    run_sync_cycle(server=remote, key=key, push=bool(remote), verbose=True)
 
-    print("=" * 64)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
